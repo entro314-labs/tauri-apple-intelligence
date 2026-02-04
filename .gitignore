@@ -27,3 +27,4 @@ SIGNING_KEY.md
 *.njsproj
 *.sln
 *.sw?
+target

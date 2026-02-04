@@ -108,19 +108,16 @@ impl std::fmt::Display for AppleAIError {
 
 impl std::error::Error for AppleAIError {}
 
-#[tauri::command]
 pub fn apple_ai_check_availability() -> Result<AppleAIAvailability, AppleAIError> {
     native::check_availability()
 }
 
-#[tauri::command]
 pub fn apple_ai_generate(
     request: AppleAIGenerateRequest,
 ) -> Result<AppleAIGenerateResult, AppleAIError> {
     native::generate(request)
 }
 
-#[tauri::command]
 pub fn apple_ai_stream(
     app: AppHandle,
     request: AppleAIGenerateRequest,
@@ -128,13 +125,121 @@ pub fn apple_ai_stream(
     native::stream(app, request)
 }
 
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __cmd__apple_ai_check_availability {
+    ($path:path, $invoke:ident) => {{
+        move || {
+            #[allow(unused_imports)]
+            use ::tauri::ipc::private::*;
+            #[allow(unused_variables)]
+            let ::tauri::ipc::Invoke {
+                message: __tauri_message__,
+                resolver: __tauri_resolver__,
+                acl: __tauri_acl__,
+            } = $invoke;
+
+            let result = $path();
+            let kind = (&result).blocking_kind();
+            kind.block(result, __tauri_resolver__);
+            return true;
+        }()
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __cmd__apple_ai_generate {
+    ($path:path, $invoke:ident) => {{
+        move || {
+            #[allow(unused_imports)]
+            use ::tauri::ipc::private::*;
+            #[allow(unused_variables)]
+            let ::tauri::ipc::Invoke {
+                message: __tauri_message__,
+                resolver: __tauri_resolver__,
+                acl: __tauri_acl__,
+            } = $invoke;
+
+            let request = match ::tauri::ipc::CommandArg::from_command(::tauri::ipc::CommandItem {
+                plugin: None,
+                name: "apple_ai_generate",
+                key: "request",
+                message: &__tauri_message__,
+                acl: &__tauri_acl__,
+            }) {
+                Ok(arg) => arg,
+                Err(err) => {
+                    __tauri_resolver__.invoke_error(err);
+                    return true;
+                }
+            };
+
+            let result = $path(request);
+            let kind = (&result).blocking_kind();
+            kind.block(result, __tauri_resolver__);
+            return true;
+        }()
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __cmd__apple_ai_stream {
+    ($path:path, $invoke:ident) => {{
+        move || {
+            #[allow(unused_imports)]
+            use ::tauri::ipc::private::*;
+            #[allow(unused_variables)]
+            let ::tauri::ipc::Invoke {
+                message: __tauri_message__,
+                resolver: __tauri_resolver__,
+                acl: __tauri_acl__,
+            } = $invoke;
+
+            let app = match ::tauri::ipc::CommandArg::from_command(::tauri::ipc::CommandItem {
+                plugin: None,
+                name: "apple_ai_stream",
+                key: "app",
+                message: &__tauri_message__,
+                acl: &__tauri_acl__,
+            }) {
+                Ok(arg) => arg,
+                Err(err) => {
+                    __tauri_resolver__.invoke_error(err);
+                    return true;
+                }
+            };
+
+            let request = match ::tauri::ipc::CommandArg::from_command(::tauri::ipc::CommandItem {
+                plugin: None,
+                name: "apple_ai_stream",
+                key: "request",
+                message: &__tauri_message__,
+                acl: &__tauri_acl__,
+            }) {
+                Ok(arg) => arg,
+                Err(err) => {
+                    __tauri_resolver__.invoke_error(err);
+                    return true;
+                }
+            };
+
+            let result = $path(app, request);
+            let kind = (&result).blocking_kind();
+            kind.block(result, __tauri_resolver__);
+            return true;
+        }()
+    }};
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod native {
     use super::*;
     use std::ffi::{CStr, CString};
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
     };
     use tauri::Emitter;
 
@@ -145,7 +250,9 @@ mod native {
         fn apple_ai_get_availability_reason() -> *mut std::os::raw::c_char;
         fn apple_ai_free_string(ptr: *mut std::os::raw::c_char);
 
-        fn apple_ai_register_tool_callback(cb: Option<extern "C" fn(u64, *const std::os::raw::c_char)>);
+        fn apple_ai_register_tool_callback(
+            cb: Option<extern "C" fn(u64, *const std::os::raw::c_char)>,
+        );
         fn apple_ai_tool_result_callback(tool_id: u64, result_json: *const std::os::raw::c_char);
 
         fn apple_ai_generate_unified(
@@ -163,8 +270,7 @@ mod native {
     static INIT: OnceLock<()> = OnceLock::new();
     static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
     static TOOL_CALLS: OnceLock<Mutex<Vec<(String, String, serde_json::Value)>>> = OnceLock::new();
-    static TOOL_NAME_MAP: OnceLock<Mutex<std::collections::HashMap<u64, String>>> =
-        OnceLock::new();
+    static TOOL_NAME_MAP: OnceLock<Mutex<std::collections::HashMap<u64, String>>> = OnceLock::new();
     static STREAM_STATE: OnceLock<Mutex<Option<StreamState>>> = OnceLock::new();
 
     struct StreamState {
@@ -212,7 +318,9 @@ mod native {
         }
     }
 
-    pub fn generate(request: AppleAIGenerateRequest) -> Result<AppleAIGenerateResult, AppleAIError> {
+    pub fn generate(
+        request: AppleAIGenerateRequest,
+    ) -> Result<AppleAIGenerateResult, AppleAIError> {
         ensure_initialized()?;
 
         let messages_json = serde_json::to_string(&request.messages)
@@ -221,30 +329,34 @@ mod native {
         let schema_json = request
             .schema
             .as_ref()
-            .map(|value| serde_json::to_string(value))
+            .map(serde_json::to_string)
             .transpose()
             .map_err(|e| AppleAIError::InvalidPayload(e.to_string()))?;
 
         let c_messages = CString::new(messages_json)
             .map_err(|_| AppleAIError::InvalidPayload("Messages contained null byte".into()))?;
         let c_tools = tools_json
-            .map(|tools| CString::new(tools))
+            .map(CString::new)
             .transpose()
             .map_err(|_| AppleAIError::InvalidPayload("Tools contained null byte".into()))?;
         let c_schema = schema_json
-            .map(|schema| CString::new(schema))
+            .map(CString::new)
             .transpose()
             .map_err(|_| AppleAIError::InvalidPayload("Schema contained null byte".into()))?;
 
-        if request.tools.as_ref().map_or(false, |t| !t.is_empty()) {
+        if request.tools.as_ref().is_some_and(|t| !t.is_empty()) {
             register_tool_callback();
         }
 
         let result_ptr = unsafe {
             apple_ai_generate_unified(
                 c_messages.as_ptr(),
-                c_tools.as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
-                c_schema.as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                c_tools
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+                c_schema
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
                 request.temperature.unwrap_or(0.0),
                 request.max_tokens.unwrap_or(0),
                 false,
@@ -325,30 +437,34 @@ mod native {
         let schema_json = request
             .schema
             .as_ref()
-            .map(|value| serde_json::to_string(value))
+            .map(serde_json::to_string)
             .transpose()
             .map_err(|e| AppleAIError::InvalidPayload(e.to_string()))?;
 
         let c_messages = CString::new(messages_json)
             .map_err(|_| AppleAIError::InvalidPayload("Messages contained null byte".into()))?;
         let c_tools = tools_json
-            .map(|tools| CString::new(tools))
+            .map(CString::new)
             .transpose()
             .map_err(|_| AppleAIError::InvalidPayload("Tools contained null byte".into()))?;
         let c_schema = schema_json
-            .map(|schema| CString::new(schema))
+            .map(CString::new)
             .transpose()
             .map_err(|_| AppleAIError::InvalidPayload("Schema contained null byte".into()))?;
 
-        if request.tools.as_ref().map_or(false, |t| !t.is_empty()) {
+        if request.tools.as_ref().is_some_and(|t| !t.is_empty()) {
             register_tool_callback();
         }
 
         std::thread::spawn(move || unsafe {
             apple_ai_generate_unified(
                 c_messages.as_ptr(),
-                c_tools.as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
-                c_schema.as_ref().map_or(std::ptr::null(), |value| value.as_ptr()),
+                c_tools
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+                c_schema
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
                 request.temperature.unwrap_or(0.0),
                 request.max_tokens.unwrap_or(0),
                 true,
@@ -415,11 +531,18 @@ mod native {
         let call_id = format!("tool-call-{}", uuid::Uuid::new_v4());
         let tool_name = TOOL_NAME_MAP
             .get()
-            .and_then(|map| map.lock().ok().and_then(|guard| guard.get(&tool_id).cloned()))
+            .and_then(|map| {
+                map.lock()
+                    .ok()
+                    .and_then(|guard| guard.get(&tool_id).cloned())
+            })
             .unwrap_or_else(|| format!("tool-{tool_id}"));
 
         if let Some(store) = TOOL_CALLS.get() {
-            store.lock().unwrap().push((call_id, tool_name, args.clone()));
+            store
+                .lock()
+                .unwrap()
+                .push((call_id, tool_name, args.clone()));
         }
 
         let result = CString::new("{}").unwrap();
@@ -503,7 +626,9 @@ mod native {
         ))
     }
 
-    pub fn generate(_request: AppleAIGenerateRequest) -> Result<AppleAIGenerateResult, AppleAIError> {
+    pub fn generate(
+        _request: AppleAIGenerateRequest,
+    ) -> Result<AppleAIGenerateResult, AppleAIError> {
         Err(AppleAIError::UnsupportedPlatform(
             "Apple Intelligence is only available on Apple Silicon macOS".into(),
         ))
