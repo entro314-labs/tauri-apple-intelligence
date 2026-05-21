@@ -257,7 +257,7 @@ private func prepareConversationContext(
         print("=== END DEBUG PARSING ===\n")
     }
 
-    // Determine conversation context – separate the latest user/assistant message
+    // Determine conversation context - separate the latest user/assistant message
     let lastMessage = messages.last!
     var currentPrompt: String = ""
 
