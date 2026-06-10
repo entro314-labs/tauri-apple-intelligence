@@ -1147,8 +1147,11 @@ public func appleAIGenerateUnified(
         semaphore.wait()
         return strdup(result)
     } else {
-        // Streaming mode
-        Task.detached {
+        // Streaming mode. The task handle is registered so `apple_ai_cancel_stream` can cancel a
+        // superseded stream (typing-driven completions abort constantly); the host enforces one
+        // active stream at a time, so a single slot is sufficient.
+        let task = Task.detached {
+            defer { StreamTaskRegistry.shared.clear() }
             do {
                 // Parse messages and prepare context
                 let context = try prepareConversationContext(
@@ -1156,6 +1159,8 @@ public func appleAIGenerateUnified(
                     temperature: temperature,
                     maxTokens: maxTokens
                 )
+
+                try Task.checkCancellation()
 
                 // Determine operation mode and stream
                 if let toolsStr = toolsJsonString, !toolsStr.isEmpty {
@@ -1178,6 +1183,10 @@ public func appleAIGenerateUnified(
                         onChunk: onChunk!
                     )
                 }
+            } catch is CancellationError {
+                // Cancelled by the host (superseded/aborted stream): terminate cleanly so the
+                // consumer sees a normal end-of-stream, not an error.
+                onChunk!(nil)
             } catch let error as ConversationError {
                 switch error {
                 case .intelligenceUnavailable(let reason):
@@ -1191,8 +1200,53 @@ public func appleAIGenerateUnified(
                 emitError(error.localizedDescription, to: onChunk!)
             }
         }
+        StreamTaskRegistry.shared.store(task)
         return nil  // Streaming returns immediately
     }
+}
+
+// MARK: - Stream cancellation
+
+/// Single-slot registry for the in-flight streaming task. The Rust host serializes streams (one
+/// active at a time), so one slot mirrors reality; `store` cancels any straggler it replaces.
+private final class StreamTaskRegistry: @unchecked Sendable {
+    static let shared = StreamTaskRegistry()
+
+    private let lock = NSLock()
+    private var current: Task<Void, Never>?
+
+    func store(_ task: Task<Void, Never>) {
+        lock.lock()
+        let previous = current
+        current = task
+        lock.unlock()
+        previous?.cancel()
+    }
+
+    /// Cancel the in-flight stream, if any. Returns whether a task was cancelled. The cancelled
+    /// task itself reports the clean end-of-stream (`onChunk(nil)`) from its CancellationError
+    /// handler, so callers must not synthesize a terminal chunk here.
+    func cancel() -> Bool {
+        lock.lock()
+        let task = current
+        lock.unlock()
+        guard let task else { return false }
+        task.cancel()
+        return true
+    }
+
+    func clear() {
+        lock.lock()
+        current = nil
+        lock.unlock()
+    }
+}
+
+/// Cancel the currently active streaming generation, if any. Safe to call at any time; a stream
+/// that already finished is a no-op (`false`).
+@_cdecl("apple_ai_cancel_stream")
+public func appleAICancelStream() -> Bool {
+    return StreamTaskRegistry.shared.cancel()
 }
 
 // MARK: - Helper functions for unified generation
@@ -1227,6 +1281,9 @@ private func handleBasicModeStream(
     for try await cumulative in session.streamResponse(
         to: context.currentPrompt, options: context.options)
     {
+        // Observe cancellation between chunks even if the framework's sequence is slow to.
+        try Task.checkCancellation()
+
         let delta = String(cumulative.content.dropFirst(prev.count))
         prev = cumulative.content
         guard !delta.isEmpty else { continue }
@@ -1407,6 +1464,9 @@ private func handleToolsMode(
         for try await cumulative in session.streamResponse(
             to: context.currentPrompt, options: context.options,
         ) {
+            // Observe cancellation between chunks even if the framework's sequence is slow to.
+            try Task.checkCancellation()
+
             // Check for early termination only if enabled
             if stopAfterToolCalls {
                 let shouldTerminate = await StreamingCoordinator.shared.shouldTerminateStream()

@@ -125,6 +125,16 @@ pub fn apple_ai_stream(
     native::stream(app, request)
 }
 
+/// Cancel the in-flight stream identified by `stream_id` (from [`AppleAIStreamStart`]).
+///
+/// Returns `Ok(true)` when the stream was active and cancellation was requested, `Ok(false)` when
+/// no matching stream is active (it already finished — a stale abort is a harmless no-op). The
+/// cancelled stream still terminates through its normal end-of-stream event (`done`), emitted by
+/// the native task's cancellation handler, so consumers need no special casing.
+pub fn apple_ai_cancel_stream(stream_id: &str) -> Result<bool, AppleAIError> {
+    native::cancel_stream(stream_id)
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __cmd__apple_ai_check_availability {
@@ -255,6 +265,8 @@ mod native {
         );
         fn apple_ai_tool_result_callback(tool_id: u64, result_json: *const std::os::raw::c_char);
 
+        fn apple_ai_cancel_stream() -> bool;
+
         fn apple_ai_generate_unified(
             messages_json: *const std::os::raw::c_char,
             tools_json: *const std::os::raw::c_char,
@@ -276,6 +288,13 @@ mod native {
     struct StreamState {
         app_handle: AppHandle,
         event_name: String,
+        /// Id from [`AppleAIStreamStart`] — `cancel_stream` only acts on a matching id, so a
+        /// stale abort for an already-finished stream can never touch a newer one.
+        stream_id: String,
+        /// Set by `cancel_stream`. The chunk callback re-issues the native cancel on the next
+        /// chunk (closing the startup race where the Swift task wasn't registered yet) and stops
+        /// emitting text the consumer already abandoned.
+        cancel_requested: bool,
     }
 
     fn ensure_initialized() -> Result<(), AppleAIError> {
@@ -415,6 +434,8 @@ mod native {
         let state = StreamState {
             app_handle: app.clone(),
             event_name: event_name.clone(),
+            stream_id: stream_id.clone(),
+            cancel_requested: false,
         };
 
         let state_mutex = STREAM_STATE.get_or_init(|| Mutex::new(None));
@@ -477,6 +498,27 @@ mod native {
             stream_id,
             event_name,
         })
+    }
+
+    pub fn cancel_stream(stream_id: &str) -> Result<bool, AppleAIError> {
+        let state_mutex = STREAM_STATE.get_or_init(|| Mutex::new(None));
+        let mut guard = state_mutex.lock().unwrap();
+        let Some(state) = guard.as_mut() else {
+            return Ok(false);
+        };
+        if state.stream_id != stream_id {
+            return Ok(false);
+        }
+
+        state.cancel_requested = true;
+        // The Swift side cancels its in-flight task; the task's cancellation handler emits the
+        // terminal nil chunk, which flows through `stream_chunk_callback` to emit `done`, reset
+        // STREAM_ACTIVE and clear this state. If the task wasn't registered yet (startup race),
+        // the chunk callback above re-issues the cancel on the first chunk.
+        unsafe {
+            apple_ai_cancel_stream();
+        }
+        Ok(true)
     }
 
     fn serialize_tools(
@@ -580,6 +622,15 @@ mod native {
             return;
         }
 
+        if state.cancel_requested {
+            // The consumer already aborted: drop the text and re-issue the native cancel — this
+            // closes the race where `cancel_stream` ran before the Swift task registered itself.
+            unsafe {
+                apple_ai_cancel_stream();
+            }
+            return;
+        }
+
         emit_event(state, AppleAIStreamEvent::Text { text: slice });
     }
 
@@ -638,6 +689,12 @@ mod native {
         _app: AppHandle,
         _request: AppleAIGenerateRequest,
     ) -> Result<AppleAIStreamStart, AppleAIError> {
+        Err(AppleAIError::UnsupportedPlatform(
+            "Apple Intelligence is only available on Apple Silicon macOS".into(),
+        ))
+    }
+
+    pub fn cancel_stream(_stream_id: &str) -> Result<bool, AppleAIError> {
         Err(AppleAIError::UnsupportedPlatform(
             "Apple Intelligence is only available on Apple Silicon macOS".into(),
         ))
