@@ -118,8 +118,8 @@ pub fn apple_ai_generate(
     native::generate(request)
 }
 
-pub fn apple_ai_stream(
-    app: AppHandle,
+pub fn apple_ai_stream<R: tauri::Runtime>(
+    app: AppHandle<R>,
     request: AppleAIGenerateRequest,
 ) -> Result<AppleAIStreamStart, AppleAIError> {
     native::stream(app, request)
@@ -286,8 +286,10 @@ mod native {
     static STREAM_STATE: OnceLock<Mutex<Option<StreamState>>> = OnceLock::new();
 
     struct StreamState {
-        app_handle: AppHandle,
-        event_name: String,
+        /// Type-erased event emitter capturing the host's `AppHandle<R>` — the state lives in a
+        /// static, which cannot be generic over the Tauri runtime, so the runtime is erased here.
+        /// This is what lets `apple_ai_stream` accept any `Runtime` (incl. tauri::test::MockRuntime).
+        emit: Box<dyn Fn(AppleAIStreamEvent) + Send + Sync>,
         /// Id from [`AppleAIStreamStart`] — `cancel_stream` only acts on a matching id, so a
         /// stale abort for an already-finished stream can never touch a newer one.
         stream_id: String,
@@ -416,8 +418,8 @@ mod native {
         })
     }
 
-    pub fn stream(
-        app: AppHandle,
+    pub fn stream<R: tauri::Runtime>(
+        app: AppHandle<R>,
         request: AppleAIGenerateRequest,
     ) -> Result<AppleAIStreamStart, AppleAIError> {
         ensure_initialized()?;
@@ -431,9 +433,11 @@ mod native {
         let stream_id = uuid::Uuid::new_v4().to_string();
         let event_name = format!("apple-ai://stream/{stream_id}");
 
+        let emit_event_name = event_name.clone();
         let state = StreamState {
-            app_handle: app.clone(),
-            event_name: event_name.clone(),
+            emit: Box::new(move |event| {
+                let _ = app.emit(&emit_event_name, event);
+            }),
             stream_id: stream_id.clone(),
             cancel_requested: false,
         };
@@ -663,7 +667,7 @@ mod native {
     }
 
     fn emit_event(state: &StreamState, event: AppleAIStreamEvent) {
-        let _ = state.app_handle.emit(&state.event_name, event);
+        (state.emit)(event);
     }
 }
 
@@ -685,8 +689,8 @@ mod native {
         ))
     }
 
-    pub fn stream(
-        _app: AppHandle,
+    pub fn stream<R: tauri::Runtime>(
+        _app: AppHandle<R>,
         _request: AppleAIGenerateRequest,
     ) -> Result<AppleAIStreamStart, AppleAIError> {
         Err(AppleAIError::UnsupportedPlatform(
