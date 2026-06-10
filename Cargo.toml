@@ -1,13 +1,13 @@
 [package]
 name = "tauri-apple-intelligence"
-version = "0.3.0"
+version = "0.3.1"
 description = "Tauri commands and native bridge for Apple Intelligence"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/entro314-labs/tauri-apple-intelligence"
 homepage = "https://github.com/entro314-labs/tauri-apple-intelligence#readme"
 edition = "2024"
-rust-version = "1.95"
+rust-version = "1.96"
 keywords = ["tauri", "apple-intelligence", "foundation-models", "on-device", "ai"]
 include = [
 	"src/**",

@@ -165,22 +165,28 @@ private func describeTranscriptEntry(_ entry: Transcript.Entry) -> String {
         }.joined(separator: " ")
         return "TOOL_OUTPUT [\(toolOutput.toolName)]: '\(content)'"
 
+    case .reasoning:
+        // macOS 27: the model can emit chain-of-thought entries in the transcript.
+        return "REASONING (omitted)"
+
     @unknown default:
         return "UNKNOWN_ENTRY"
     }
 }
 
+@available(macOS 26.0, *)
 struct Guardrails {
+    /// Relaxed guardrails via the PUBLIC API only.
+    ///
+    /// This previously reinterpreted the raw memory of `SystemLanguageModel.Guardrails` and
+    /// stomped its first byte to `false` — relying on the private macOS 26 field layout. macOS 27
+    /// changed the struct's internals, so the stomp corrupted what is no longer a Bool and the
+    /// framework later dereferenced the mangled value: hard SIGSEGV (KERN_INVALID_ADDRESS) deep
+    /// inside FoundationModels on a Swift-concurrency thread, crashing the host app. Never poke
+    /// resilient framework types; `.permissiveContentTransformations` is the supported way to
+    /// relax guardrails for content-transformation workloads.
     static var developerProvided: SystemLanguageModel.Guardrails {
-        var guardrails = SystemLanguageModel.Guardrails.default
-
-        withUnsafeMutablePointer(to: &guardrails) { ptr in
-            let rawPtr = UnsafeMutableRawPointer(ptr)
-            let boolPtr = rawPtr.assumingMemoryBound(to: Bool.self)
-            boolPtr.pointee = false
-        }
-
-        return guardrails
+        SystemLanguageModel.Guardrails.permissiveContentTransformations
     }
 }
 
