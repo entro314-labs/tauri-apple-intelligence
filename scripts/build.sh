@@ -5,6 +5,14 @@ set -euo pipefail
 
 echo "🔨  Building Apple On-Device AI library components …"
 
+# Resolve paths relative to this script, not the caller's CWD, so the build
+# works no matter where it's invoked from.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SRC="${ROOT_DIR}/ailib/apple-ai.swift"
+# Emit straight into prebuilt/, which is where build.rs and the linker consume it.
+OUT_DIR="${ROOT_DIR}/prebuilt"
+
 # Check if we're on macOS
 if [[ "$OSTYPE" != "darwin"* ]]; then
     echo "❌ Error: This library can only be built on macOS"
@@ -18,11 +26,11 @@ if (( MACOS_MAJOR < 26 )); then
   exit 1
 fi
 
-# Create build directory
-mkdir -p build
+# Create output directory
+mkdir -p "${OUT_DIR}"
 
 # Build Swift dylib
-echo "📦  Swift → build/libappleai.dylib"
+echo "📦  Swift → ${OUT_DIR}/libappleai.dylib"
 swiftc \
   -O -whole-module-optimization \
   -emit-library -emit-module -module-name AppleOnDeviceAI \
@@ -30,7 +38,7 @@ swiftc \
   -target arm64-apple-macos26.0 \
   -Xlinker -install_name -Xlinker @rpath/libappleai.dylib \
   -Xlinker -rpath -Xlinker @loader_path \
-  ../ailib/apple-ai.swift \
-  -o build/libappleai.dylib
+  "${SRC}" \
+  -o "${OUT_DIR}/libappleai.dylib"
 
-echo "✅  Swift dylib built"
+echo "✅  Swift dylib built → ${OUT_DIR}/libappleai.dylib"
