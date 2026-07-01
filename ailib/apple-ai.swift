@@ -265,12 +265,17 @@ private func prepareConversationContext(
 
     // Determine conversation context - separate the latest user/assistant message
     let lastMessage = messages.last!
-    var currentPrompt: String = ""
+    let lastIsUserPrompt = lastMessage.role.lowercased() == "user"
+    let currentPrompt: String = lastIsUserPrompt ? (lastMessage.content ?? "") : ""
 
-    currentPrompt = (lastMessage.role.lowercased() == "user") ? (lastMessage.content ?? "") : ""
-
-    // Build transcript entries from the remaining messages
-    let transcriptEntries = convertMessagesToTranscript(messages)
+    // Build transcript entries from the PRIOR turns only. The latest user message is answered via
+    // `session.respond(to: currentPrompt)`, so it must NOT also appear as a trailing `.prompt` entry
+    // in the transcript. A transcript that ends in a dangling, unanswered prompt duplicating the one
+    // we respond to makes the on-device `LanguageModelSession` drop/short-circuit the reply — the
+    // "ignores every other message, only answers the 2nd" bug. Feed prior turns as history and let
+    // `respond(to:)` own the current turn.
+    let historyMessages = lastIsUserPrompt ? Array(messages.dropLast()) : messages
+    let transcriptEntries = convertMessagesToTranscript(historyMessages)
 
     // Create generation options
     var options = GenerationOptions()
