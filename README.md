@@ -1,6 +1,7 @@
 # tauri-apple-intelligence
 
-Native Tauri commands for Apple Intelligence (Foundation Models) with streaming + tool calling support.
+Native Tauri commands for Apple Intelligence (Foundation Models) with streaming, tool calling,
+**Private Cloud Compute**, **reasoning**, **multimodal image input**, and **live token/context usage**.
 
 Companion JS transport: https://github.com/entro314-labs/apple-intelligence-sdk
 
@@ -8,8 +9,22 @@ Companion JS transport: https://github.com/entro314-labs/apple-intelligence-sdk
 
 ```toml
 [dependencies]
-tauri-apple-intelligence = "0.1"
+tauri-apple-intelligence = "0.6"
 ```
+
+## Capabilities
+
+| Capability | Command(s) | Notes |
+|---|---|---|
+| Availability (on-device) | `apple_ai_check_availability` | Device eligible + Apple Intelligence enabled + model ready |
+| Availability (Private Cloud Compute) | `apple_ai_pcc_check_availability` | macOS 27+; larger, reasoning-capable, still private (no API key/bill) |
+| Generate / stream | `apple_ai_generate`, `apple_ai_stream`, `apple_ai_cancel_stream` | Basic, tools, and structured modes; `model: "on-device" \| "private-cloud"`, `reasoningLevel`, and per-message `images` |
+| Context window | `apple_ai_context_info` | Real `contextSize` per model (4k on-device, ~32k PCC) — stop hardcoding |
+| Supported languages | `apple_ai_supported_languages` | Live BCP-47 tags from `SystemLanguageModel.supportedLanguages` |
+| Prewarm | `apple_ai_prewarm` | Lower first-token latency |
+
+Generation results and streams carry a `usage` object (`inputTokens`, `cachedInputTokens`,
+`outputTokens`, `reasoningTokens`) on macOS 27+.
 
 ## Usage
 
@@ -60,7 +75,10 @@ The JS transport expects `apple_ai_*` command names by default. If you rename th
 
 ## Supported platforms
 
-- ✅ macOS 26+ on Apple Silicon
+- ✅ macOS 26+ on Apple Silicon (on-device model, streaming, tools, structured output)
+- ✅ macOS 27+ adds Private Cloud Compute, reasoning levels, multimodal image input, and per-call
+  token usage — all gated behind `@available(macOS 27, *)`, so the crate still runs on macOS 26 with
+  those features simply unavailable
 - ❌ Other platforms (returns `UnsupportedPlatform`)
 
 ## License
