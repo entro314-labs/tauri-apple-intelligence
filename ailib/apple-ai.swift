@@ -1,5 +1,7 @@
+import CoreGraphics
 import Foundation
 import FoundationModels
+import ImageIO
 
 // MARK: - C-compatible data structures
 
@@ -80,19 +82,18 @@ public func appleAIGetSupportedLanguage(index: Int32) -> UnsafeMutablePointer<CC
     }
 
     let language = languagesArray[Int(index)]
-    let locale = Locale(identifier: language.maximalIdentifier)
 
-    // Get the display name in the current locale
-    if let displayName = locale.localizedString(forIdentifier: language.maximalIdentifier) {
-        return strdup(displayName)
+    // Return a stable BCP-47 tag (e.g. "en", "fr", "zh-Hans"), NOT a localized display name — the
+    // host matches these programmatically (by base subtag) and renders its own display names.
+    let identifier = language.minimalIdentifier
+    if !identifier.isEmpty {
+        return strdup(identifier)
     }
-
-    // Fallback to language code if display name is not available
     if let languageCode = language.languageCode?.identifier {
         return strdup(languageCode)
     }
 
-    return strdup("Unknown")
+    return strdup("und")
 }
 
 @_cdecl("apple_ai_free_string")
@@ -100,6 +101,177 @@ public func appleAIFreeString(ptr: UnsafeMutablePointer<CChar>?) {
     if let ptr = ptr {
         free(ptr)
     }
+}
+
+// MARK: - Model selection & 2026 capabilities (Private Cloud Compute, context, usage, reasoning, images)
+
+/// Which on-device / private model backs a request. Parsed from the `model` argument the host
+/// threads through `apple_ai_generate_unified`; any unrecognized value falls back to on-device.
+private enum ModelKind {
+    case onDevice
+    case privateCloud
+
+    static func parse(_ raw: String?) -> ModelKind {
+        raw == "private-cloud" ? .privateCloud : .onDevice
+    }
+}
+
+/// Token usage for one generation. Plain `Int`s (no `@available`) so it threads through the
+/// macOS-26 code paths untyped; only populated from `session.usage` on macOS 27+.
+private struct UsageInfo {
+    var inputTokens: Int
+    var cachedInputTokens: Int
+    var outputTokens: Int
+    var reasoningTokens: Int
+
+    var jsonObject: [String: Any] {
+        [
+            "inputTokens": inputTokens,
+            "cachedInputTokens": cachedInputTokens,
+            "outputTokens": outputTokens,
+            "reasoningTokens": reasoningTokens,
+        ]
+    }
+}
+
+@available(macOS 27.0, *)
+private func readUsage(from session: LanguageModelSession) -> UsageInfo {
+    let usage = session.usage
+    return UsageInfo(
+        inputTokens: usage.input.totalTokenCount,
+        cachedInputTokens: usage.input.cachedTokenCount,
+        outputTokens: usage.output.totalTokenCount,
+        reasoningTokens: usage.output.reasoningTokenCount
+    )
+}
+
+/// Map the host's reasoning-level string onto `ContextOptions.ReasoningLevel`. `nil`/`"none"` means
+/// no reasoning; unknown values pass through as `.custom` so future levels aren't dropped.
+@available(macOS 27.0, *)
+private func parseReasoningLevel(_ raw: String?) -> ContextOptions.ReasoningLevel? {
+    guard let raw, !raw.isEmpty else { return nil }
+    switch raw.lowercased() {
+    case "none", "off": return nil
+    case "light", "low": return .light
+    case "moderate", "medium": return .moderate
+    case "deep", "high": return .deep
+    default: return .custom(raw)
+    }
+}
+
+/// A single image attached to the current user turn: a file URL (preferred — zero-copy) or inline
+/// base64 bytes. Decoded into a Foundation Models `Attachment` on macOS 27.
+private struct ImageInput: Codable {
+    let mediaType: String?
+    let fileURL: String?
+    let base64: String?
+}
+
+@available(macOS 27.0, *)
+private func makeImageAttachment(_ input: ImageInput) -> Attachment<ImageAttachmentContent>? {
+    if let path = input.fileURL, !path.isEmpty {
+        let url = path.hasPrefix("file://") ? URL(string: path) : URL(fileURLWithPath: path)
+        if let url {
+            return Attachment(imageURL: url)
+        }
+    }
+    if let base64 = input.base64,
+        let data = Data(base64Encoded: base64),
+        let source = CGImageSourceCreateWithData(data as CFData, nil),
+        let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil)
+    {
+        return Attachment(cgImage)
+    }
+    return nil
+}
+
+/// Availability of the Private Cloud Compute model (macOS 27+). Codes mirror
+/// `apple_ai_check_availability`: 1 available, -1 device-not-eligible, -3 system-not-ready,
+/// -4 requires macOS 27, -99 unknown.
+@_cdecl("apple_ai_pcc_check_availability")
+public func appleAIPCCCheckAvailability() -> Int32 {
+    guard #available(macOS 27.0, *) else { return -4 }
+    switch PrivateCloudComputeLanguageModel().availability {
+    case .available: return 1
+    case .unavailable(.deviceNotEligible): return -1
+    case .unavailable(.systemNotReady): return -3
+    @unknown default: return -99
+    }
+}
+
+@_cdecl("apple_ai_pcc_get_availability_reason")
+public func appleAIPCCGetAvailabilityReason() -> UnsafeMutablePointer<CChar>? {
+    guard #available(macOS 27.0, *) else {
+        return strdup("Private Cloud Compute requires macOS 27 or later.")
+    }
+    switch PrivateCloudComputeLanguageModel().availability {
+    case .available:
+        return strdup("Private Cloud Compute is available")
+    case .unavailable(.deviceNotEligible):
+        return strdup("This device is not eligible for Apple Intelligence Private Cloud Compute.")
+    case .unavailable(.systemNotReady):
+        return strdup("Private Cloud Compute is not ready yet. Please try again shortly.")
+    @unknown default:
+        return strdup("Private Cloud Compute is unavailable.")
+    }
+}
+
+/// Max context window (tokens) for a model. On-device uses the back-deployed `contextSize` (4096
+/// pre-27, real value on 27+). Private Cloud Compute reads its async `contextSize`; returns -1 when
+/// it can't be determined (PCC unavailable, or pre-27).
+@_cdecl("apple_ai_context_size")
+public func appleAIContextSize(model: UnsafePointer<CChar>?) -> Int32 {
+    switch ModelKind.parse(model.map { String(cString: $0) }) {
+    case .onDevice:
+        return Int32(SystemLanguageModel.default.contextSize)
+    case .privateCloud:
+        guard #available(macOS 27.0, *) else { return -1 }
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Int32 = -1
+        Task {
+            defer { semaphore.signal() }
+            if let size = try? await PrivateCloudComputeLanguageModel().contextSize {
+                result = Int32(size)
+            }
+        }
+        semaphore.wait()
+        return result
+    }
+}
+
+/// Prewarm a model so the first real request pays less first-token latency. Best-effort; a no-op
+/// when the model can't be constructed on this OS.
+@_cdecl("apple_ai_prewarm")
+public func appleAIPrewarm(model: UnsafePointer<CChar>?) {
+    switch ModelKind.parse(model.map { String(cString: $0) }) {
+    case .onDevice:
+        LanguageModelSession(
+            model: SystemLanguageModel(guardrails: Guardrails.developerProvided)
+        ).prewarm()
+    case .privateCloud:
+        guard #available(macOS 27.0, *) else { return }
+        LanguageModelSession(model: PrivateCloudComputeLanguageModel()).prewarm()
+    }
+}
+
+/// Build a session backed by the requested model. Private Cloud Compute is used only on macOS 27+;
+/// otherwise (and for on-device) the permissive-guardrail `SystemLanguageModel` is used. Both models
+/// conform to `LanguageModel`, so the tools + transcript flow is identical.
+@available(macOS 26.0, *)
+private func makeSession(
+    modelKind: ModelKind,
+    tools: [any Tool],
+    transcript: Transcript
+) -> LanguageModelSession {
+    if case .privateCloud = modelKind, #available(macOS 27.0, *) {
+        return LanguageModelSession(
+            model: PrivateCloudComputeLanguageModel(), tools: tools, transcript: transcript)
+    }
+    return LanguageModelSession(
+        model: SystemLanguageModel(guardrails: Guardrails.developerProvided),
+        tools: tools,
+        transcript: transcript
+    )
 }
 
 // MARK: - Debug Logging
@@ -197,6 +369,10 @@ private struct ConversationContext {
     let currentPrompt: String
     let transcriptEntries: [Transcript.Entry]
     let options: GenerationOptions
+    let modelKind: ModelKind
+    let reasoningLevel: String?
+    /// Images attached to the current user turn (multimodal input, macOS 27+).
+    let images: [ImageInput]
 }
 
 private enum ConversationError: Error {
@@ -208,7 +384,9 @@ private enum ConversationError: Error {
 private func prepareConversationContext(
     messagesJsonString: String,
     temperature: Double,
-    maxTokens: Int32
+    maxTokens: Int32,
+    modelKind: ModelKind,
+    reasoningLevel: String?
 ) throws -> ConversationContext {
     if DEBUG_LOGS {
         print("\n=== DEBUG: PARSING MESSAGES ===")
@@ -267,6 +445,8 @@ private func prepareConversationContext(
     let lastMessage = messages.last!
     let lastIsUserPrompt = lastMessage.role.lowercased() == "user"
     let currentPrompt: String = lastIsUserPrompt ? (lastMessage.content ?? "") : ""
+    // Images ride on the current user turn only; prior-turn images aren't replayed as history.
+    let currentImages: [ImageInput] = lastIsUserPrompt ? (lastMessage.images ?? []) : []
 
     // Build transcript entries from the PRIOR turns only. The latest user message is answered via
     // `session.respond(to: currentPrompt)`, so it must NOT also appear as a trailing `.prompt` entry
@@ -291,7 +471,10 @@ private func prepareConversationContext(
     return ConversationContext(
         currentPrompt: currentPrompt,
         transcriptEntries: transcriptEntries,
-        options: options
+        options: options,
+        modelKind: modelKind,
+        reasoningLevel: reasoningLevel,
+        images: currentImages
     )
 }
 
@@ -301,24 +484,27 @@ private struct ChatMessage: Codable {
     let name: String?
     let tool_call_id: String?  // OpenAI-compatible snake_case
     let tool_calls: [[String: Any]]?  // OpenAI-compatible tool calls array
+    let images: [ImageInput]?  // Optional image attachments (multimodal, macOS 27+)
 
     init(
         role: String,
         content: String? = nil,
         name: String? = nil,
         tool_call_id: String? = nil,
-        tool_calls: [[String: Any]]? = nil
+        tool_calls: [[String: Any]]? = nil,
+        images: [ImageInput]? = nil
     ) {
         self.role = role
         self.content = content
         self.name = name
         self.tool_call_id = tool_call_id
         self.tool_calls = tool_calls
+        self.images = images
     }
 
     // Custom encoding/decoding to handle the dynamic tool_calls array
     enum CodingKeys: String, CodingKey {
-        case role, content, name, tool_call_id, tool_calls
+        case role, content, name, tool_call_id, tool_calls, images
     }
 
     init(from decoder: Decoder) throws {
@@ -327,6 +513,7 @@ private struct ChatMessage: Codable {
         content = try container.decodeIfPresent(String.self, forKey: .content)  // Made optional
         name = try container.decodeIfPresent(String.self, forKey: .name)
         tool_call_id = try container.decodeIfPresent(String.self, forKey: .tool_call_id)
+        images = try container.decodeIfPresent([ImageInput].self, forKey: .images)
 
         // Properly decode tool_calls if present
         if container.contains(.tool_calls) {
@@ -677,14 +864,36 @@ private func createToolOutputEntry(from message: ChatMessage) -> [Transcript.Ent
     return entries
 }
 
-// Control-B (0x02) sentinel prefix marks an error string in streaming callbacks
+// Streaming callback sentinel prefixes. A chunk's first byte tags its channel; untagged chunks are
+// plain answer-text deltas. The Rust host decodes the same table:
+//   0x02  error         — the remainder is an error message
+//   0x03  reasoning      — the remainder is a reasoning/chain-of-thought text delta (reserved)
+//   0x04  usage          — the remainder is a JSON usage object, emitted once before end-of-stream
 private let ERROR_SENTINEL: Character = "\u{0002}"
+private let REASONING_SENTINEL: Character = "\u{0003}"
+private let USAGE_SENTINEL: Character = "\u{0004}"
 
 @inline(__always)
 private func emitError(
     _ message: String, to onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)
 ) {
     let full = String(ERROR_SENTINEL) + message
+    full.withCString { cStr in
+        onChunk(strdup(cStr))
+    }
+}
+
+/// Emit a token-usage summary on the stream just before end-of-stream. No-op when usage is absent
+/// (e.g. macOS 26, which does not report per-call token counts).
+@inline(__always)
+private func emitUsage(
+    _ usage: UsageInfo?, to onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)
+) {
+    guard let usage,
+        let data = try? JSONSerialization.data(withJSONObject: usage.jsonObject),
+        let json = String(data: data, encoding: .utf8)
+    else { return }
+    let full = String(USAGE_SENTINEL) + json
     full.withCString { cStr in
         onChunk(strdup(cStr))
     }
@@ -1084,6 +1293,8 @@ public func appleAIGenerateUnified(
     messagesJson: UnsafePointer<CChar>,
     toolsJson: UnsafePointer<CChar>?,
     schemaJson: UnsafePointer<CChar>?,
+    model: UnsafePointer<CChar>?,  // "on-device" (default) | "private-cloud"
+    reasoningLevel: UnsafePointer<CChar>?,  // nil | "light" | "moderate" | "deep" | custom
     temperature: Double,
     maxTokens: Int32,
     stream: Bool,
@@ -1093,6 +1304,8 @@ public func appleAIGenerateUnified(
     let messagesJsonString = String(cString: messagesJson)
     let toolsJsonString = toolsJson.map { String(cString: $0) }
     let schemaJsonString = schemaJson.map { String(cString: $0) }
+    let modelKind = ModelKind.parse(model.map { String(cString: $0) })
+    let reasoningLevelString = reasoningLevel.map { String(cString: $0) }
 
     // Validate streaming parameters
     if stream && onChunk == nil {
@@ -1110,7 +1323,9 @@ public func appleAIGenerateUnified(
                 let context = try prepareConversationContext(
                     messagesJsonString: messagesJsonString,
                     temperature: temperature,
-                    maxTokens: maxTokens
+                    maxTokens: maxTokens,
+                    modelKind: modelKind,
+                    reasoningLevel: reasoningLevelString
                 )
 
                 // Determine operation mode based on provided parameters
@@ -1162,7 +1377,9 @@ public func appleAIGenerateUnified(
                 let context = try prepareConversationContext(
                     messagesJsonString: messagesJsonString,
                     temperature: temperature,
-                    maxTokens: maxTokens
+                    maxTokens: maxTokens,
+                    modelKind: modelKind,
+                    reasoningLevel: reasoningLevelString
                 )
 
                 try Task.checkCancellation()
@@ -1256,17 +1473,69 @@ public func appleAICancelStream() -> Bool {
 
 // MARK: - Helper functions for unified generation
 
+/// Respond to the current turn, choosing the overload that fits the request. On macOS 27+ a request
+/// with a reasoning level or image attachments uses the `contextOptions` + `PromptBuilder` overload
+/// (the only one that accepts them) and reads real token usage; otherwise the plain string overload.
+@available(macOS 26.0, *)
+private func respondText(
+    session: LanguageModelSession,
+    context: ConversationContext
+) async throws -> (text: String, usage: UsageInfo?) {
+    if #available(macOS 27.0, *) {
+        let reasoning = parseReasoningLevel(context.reasoningLevel)
+        let attachments = context.images.compactMap { makeImageAttachment($0) }
+        if reasoning != nil || !attachments.isEmpty {
+            let contextOptions = ContextOptions(reasoningLevel: reasoning)
+            let response = try await session.respond(
+                options: context.options,
+                contextOptions: contextOptions
+            ) {
+                context.currentPrompt
+                for attachment in attachments { attachment }
+            }
+            return (response.content, readUsage(from: session))
+        }
+        let response = try await session.respond(
+            to: context.currentPrompt, options: context.options)
+        return (response.content, readUsage(from: session))
+    }
+    let response = try await session.respond(to: context.currentPrompt, options: context.options)
+    return (response.content, nil)
+}
+
+/// Build the streaming response for the current turn, mirroring `respondText`'s overload selection.
+@available(macOS 26.0, *)
+private func makeTextStream(
+    session: LanguageModelSession,
+    context: ConversationContext
+) -> LanguageModelSession.ResponseStream<String> {
+    if #available(macOS 27.0, *) {
+        let reasoning = parseReasoningLevel(context.reasoningLevel)
+        let attachments = context.images.compactMap { makeImageAttachment($0) }
+        if reasoning != nil || !attachments.isEmpty {
+            let contextOptions = ContextOptions(reasoningLevel: reasoning)
+            return session.streamResponse(
+                options: context.options,
+                contextOptions: contextOptions
+            ) {
+                context.currentPrompt
+                for attachment in attachments { attachment }
+            }
+        }
+    }
+    return session.streamResponse(to: context.currentPrompt, options: context.options)
+}
+
 @available(macOS 26.0, *)
 private func handleBasicMode(context: ConversationContext) async throws -> String {
     let transcript = Transcript(entries: context.transcriptEntries)
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
-    let model = SystemLanguageModel(guardrails: Guardrails.developerProvided)
-    let session = LanguageModelSession(
-        model: model, transcript: transcript)
-    let response = try await session.respond(to: context.currentPrompt, options: context.options)
+    let session = makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
+    let (text, usage) = try await respondText(session: session, context: context)
 
     // Return as JSON for consistency
-    let json: [String: Any] = ["text": response.content]
+    var json: [String: Any] = ["text": text]
+    if let usage { json["usage"] = usage.jsonObject }
     let jsonData = try JSONSerialization.data(withJSONObject: json, options: [])
     return String(data: jsonData, encoding: .utf8) ?? "Error: Encoding failure"
 }
@@ -1278,14 +1547,10 @@ private func handleBasicModeStream(
 ) async throws {
     let transcript = Transcript(entries: context.transcriptEntries)
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
-    let model = SystemLanguageModel(guardrails: Guardrails.developerProvided)
-    let session = LanguageModelSession(
-        model: model, transcript: transcript)
+    let session = makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
 
     var prev = ""
-    for try await cumulative in session.streamResponse(
-        to: context.currentPrompt, options: context.options)
-    {
+    for try await cumulative in makeTextStream(session: session, context: context) {
         // Observe cancellation between chunks even if the framework's sequence is slow to.
         try Task.checkCancellation()
 
@@ -1296,6 +1561,9 @@ private func handleBasicModeStream(
         delta.withCString { cStr in
             onChunk(strdup(cStr))
         }
+    }
+    if #available(macOS 27.0, *) {
+        emitUsage(readUsage(from: session), to: onChunk)
     }
     onChunk(nil)  // Signal end of stream
 }
@@ -1319,9 +1587,7 @@ private func handleStructuredMode(
     // Create session without tools (structured generation doesn't use tools constructor)
     let transcript = Transcript(entries: context.transcriptEntries)
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
-    let model = SystemLanguageModel(guardrails: Guardrails.developerProvided)
-    let session = LanguageModelSession(
-        model: model, transcript: transcript)
+    let session = makeSession(modelKind: context.modelKind, tools: [], transcript: transcript)
 
     // Generate structured response
     let response = try await session.respond(
@@ -1335,10 +1601,11 @@ private func handleStructuredMode(
     let objectJson = generatedContentToJSON(generatedContent)
     let textRepresentation = String(describing: generatedContent)
 
-    let json: [String: Any] = [
+    var json: [String: Any] = [
         "text": textRepresentation,
         "object": objectJson,
     ]
+    if #available(macOS 27.0, *) { json["usage"] = readUsage(from: session).jsonObject }
 
     let jsonData = try JSONSerialization.data(withJSONObject: json, options: [])
     return String(data: jsonData, encoding: .utf8) ?? "Error: Encoding failure"
@@ -1413,23 +1680,19 @@ private func handleToolsMode(
 
     let transcript = Transcript(entries: finalEntries)
     debugPrintTranscript(transcript, prompt: context.currentPrompt)
-    let model = SystemLanguageModel(guardrails: Guardrails.developerProvided)
-    let session = LanguageModelSession(
-        model: model, tools: tools, transcript: transcript)
+    let session = makeSession(modelKind: context.modelKind, tools: tools, transcript: transcript)
 
     // Reset tool call collection
     ToolCallCollector.shared.reset()
 
     if !streaming {
-        // Non-streaming with tools
-        let response = try await session.respond(
-            to: context.currentPrompt, options: context.options
-        )
-
-        let text = response.content
+        // Non-streaming with tools. `respondText` honors reasoning level / image attachments and
+        // reads token usage; tool calls are gathered as a side effect via ToolCallCollector.
+        let (text, usage) = try await respondText(session: session, context: context)
         let toolCalls = ToolCallCollector.shared.getAllCalls()
 
         var json: [String: Any] = [:]
+        if let usage { json["usage"] = usage.jsonObject }
 
         if !toolCalls.isEmpty {
             let formattedCalls = toolCalls.map { call in
@@ -1466,9 +1729,7 @@ private func handleToolsMode(
         )
 
         var prev = ""
-        for try await cumulative in session.streamResponse(
-            to: context.currentPrompt, options: context.options,
-        ) {
+        for try await cumulative in makeTextStream(session: session, context: context) {
             // Observe cancellation between chunks even if the framework's sequence is slow to.
             try Task.checkCancellation()
 
@@ -1490,6 +1751,9 @@ private func handleToolsMode(
         }
 
         // Signal completion
+        if #available(macOS 27.0, *) {
+            emitUsage(readUsage(from: session), to: onChunk)
+        }
         onChunk(nil)
         return ""  // Not used in streaming mode
     }
