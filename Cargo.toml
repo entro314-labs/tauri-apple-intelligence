@@ -1,6 +1,6 @@
 [package]
 name = "tauri-apple-intelligence"
-version = "0.6.4"
+version = "0.6.5"
 description = "Tauri commands and native bridge for Apple Intelligence"
 license = "MIT"
 readme = "README.md"
@@ -11,6 +11,7 @@ rust-version = "1.96"
 keywords = ["tauri", "apple-intelligence", "foundation-models", "on-device", "ai"]
 include = [
 	"src/**",
+	"build.rs",
 	"prebuilt/**",
 	"ailib/**",
 	"scripts/**",
