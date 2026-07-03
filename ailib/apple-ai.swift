@@ -245,12 +245,18 @@ public func appleAIContextSize(model: UnsafePointer<CChar>?) -> Int32 {
 public func appleAIPrewarm(model: UnsafePointer<CChar>?) {
     switch ModelKind.parse(model.map { String(cString: $0) }) {
     case .onDevice:
-        LanguageModelSession(
-            model: SystemLanguageModel(guardrails: Guardrails.developerProvided)
-        ).prewarm()
+        // Prewarm only when the exact model instance is available. Calling `.prewarm()` on an
+        // unavailable model trips a Swift `assertionFailure` inside FoundationModels on macOS 27
+        // betas — a hard trap that aborts the process. The availability of this permissive-guardrail
+        // instance can differ from `SystemLanguageModel.default`, so we must re-check it here.
+        let onDeviceModel = SystemLanguageModel(guardrails: Guardrails.developerProvided)
+        guard case .available = onDeviceModel.availability else { return }
+        LanguageModelSession(model: onDeviceModel).prewarm()
     case .privateCloud:
         guard #available(macOS 27.0, *) else { return }
-        LanguageModelSession(model: PrivateCloudComputeLanguageModel()).prewarm()
+        let pccModel = PrivateCloudComputeLanguageModel()
+        guard case .available = pccModel.availability else { return }
+        LanguageModelSession(model: pccModel).prewarm()
     }
 }
 
