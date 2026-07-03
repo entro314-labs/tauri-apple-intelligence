@@ -245,11 +245,12 @@ public func appleAIContextSize(model: UnsafePointer<CChar>?) -> Int32 {
 public func appleAIPrewarm(model: UnsafePointer<CChar>?) {
     switch ModelKind.parse(model.map { String(cString: $0) }) {
     case .onDevice:
-        // Prewarm only when the exact model instance is available. Calling `.prewarm()` on an
-        // unavailable model trips a Swift `assertionFailure` inside FoundationModels on macOS 27
-        // betas — a hard trap that aborts the process. The availability of this permissive-guardrail
-        // instance can differ from `SystemLanguageModel.default`, so we must re-check it here.
-        let onDeviceModel = SystemLanguageModel(guardrails: Guardrails.developerProvided)
+        // Prewarm only when the model instance is available. Calling `.prewarm()` on an unavailable
+        // model trips a Swift `assertionFailure` inside FoundationModels on macOS 27 betas — a hard
+        // trap that aborts the process. Use the same on-device model `makeSession` uses (default
+        // guardrails on macOS 27 — see makeOnDeviceModel), so warm and real requests share a model
+        // and prewarm doesn't hit the permissive-guardrails regression on 26A5368g.
+        let onDeviceModel = makeOnDeviceModel()
         guard case .available = onDeviceModel.availability else { return }
         LanguageModelSession(model: onDeviceModel).prewarm()
     case .privateCloud:
@@ -260,8 +261,28 @@ public func appleAIPrewarm(model: UnsafePointer<CChar>?) {
     }
 }
 
+/// The on-device `SystemLanguageModel` to back a session with.
+///
+/// macOS 27 beta build 26A5368g regressed permissive guardrails: loading a session backed by
+/// `SystemLanguageModel(guardrails: .permissiveContentTransformations)` trips a Swift
+/// `assertionFailure` deep inside FoundationModels (the same assertion hit by both `prewarm()` and
+/// `respond(...)`) — a hard SIGTRAP that aborts the host process and can't be caught, since it's
+/// foreign code. The default-guardrails shared model (`SystemLanguageModel.default`, the exact
+/// instance the availability/context/languages probes use) does NOT assert. So on macOS 27 we use
+/// default guardrails (Apple's standard content filtering) to keep generation working, and keep the
+/// permissive content-transformation guardrails on macOS 26 where they still work. Revisit and
+/// restore permissive on macOS 27 once a later build stops asserting (permissive generation passed
+/// 3/3 on an earlier 27 build, so this is a beta regression, not a permanent API change).
+@available(macOS 26.0, *)
+private func makeOnDeviceModel() -> SystemLanguageModel {
+    if #available(macOS 27.0, *) {
+        return SystemLanguageModel.default
+    }
+    return SystemLanguageModel(guardrails: Guardrails.developerProvided)
+}
+
 /// Build a session backed by the requested model. Private Cloud Compute is used only on macOS 27+;
-/// otherwise (and for on-device) the permissive-guardrail `SystemLanguageModel` is used. Both models
+/// otherwise (and for on-device) the on-device model from `makeOnDeviceModel()` is used. Both models
 /// conform to `LanguageModel`, so the tools + transcript flow is identical.
 @available(macOS 26.0, *)
 private func makeSession(
@@ -274,7 +295,7 @@ private func makeSession(
             model: PrivateCloudComputeLanguageModel(), tools: tools, transcript: transcript)
     }
     return LanguageModelSession(
-        model: SystemLanguageModel(guardrails: Guardrails.developerProvided),
+        model: makeOnDeviceModel(),
         tools: tools,
         transcript: transcript
     )
