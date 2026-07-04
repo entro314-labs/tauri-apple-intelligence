@@ -33,6 +33,10 @@ fn request(prompt: &str) -> AppleAIGenerateRequest {
         reasoning_level: None,
         temperature: Some(0.7),
         max_tokens: Some(2000),
+        top_p: None,
+        top_k: None,
+        seed: None,
+        tool_choice: None,
         stop_after_tool_calls: None,
     }
 }

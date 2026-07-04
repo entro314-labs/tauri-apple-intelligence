@@ -240,9 +240,15 @@ public func appleAIContextSize(model: UnsafePointer<CChar>?) -> Int32 {
 }
 
 /// Prewarm a model so the first real request pays less first-token latency. Best-effort; a no-op
-/// when the model can't be constructed on this OS.
+/// when the model can't be constructed on this OS. `promptPrefix` (nullable) lets the system
+/// eagerly process a known prefix of the upcoming prompt (`prewarm(promptPrefix:)`), further
+/// reducing latency when the host knows what it is about to send (e.g. the system instructions).
 @_cdecl("apple_ai_prewarm")
-public func appleAIPrewarm(model: UnsafePointer<CChar>?) {
+public func appleAIPrewarm(model: UnsafePointer<CChar>?, promptPrefix: UnsafePointer<CChar>?) {
+    let prefix: Prompt? = promptPrefix.flatMap {
+        let text = String(cString: $0)
+        return text.isEmpty ? nil : Prompt(text)
+    }
     switch ModelKind.parse(model.map { String(cString: $0) }) {
     case .onDevice:
         // Prewarm only when the model instance is available. Calling `.prewarm()` on an unavailable
@@ -252,13 +258,36 @@ public func appleAIPrewarm(model: UnsafePointer<CChar>?) {
         // and prewarm doesn't hit the permissive-guardrails regression on 26A5368g.
         let onDeviceModel = makeOnDeviceModel()
         guard case .available = onDeviceModel.availability else { return }
-        LanguageModelSession(model: onDeviceModel).prewarm()
+        LanguageModelSession(model: onDeviceModel).prewarm(promptPrefix: prefix)
     case .privateCloud:
         guard #available(macOS 27.0, *) else { return }
         let pccModel = PrivateCloudComputeLanguageModel()
         guard case .available = pccModel.availability else { return }
-        LanguageModelSession(model: pccModel).prewarm()
+        LanguageModelSession(model: pccModel).prewarm(promptPrefix: prefix)
     }
+}
+
+/// Token count for `text` measured by the on-device model's tokenizer (`tokenCount(for:)`,
+/// macOS 26.4+). Lets hosts budget prompts against `apple_ai_context_size` instead of guessing.
+/// Returns -2 when the OS is too old, -1 when the count can't be determined (model unavailable,
+/// tokenizer error, or the Private Cloud Compute model — which exposes no tokenizer).
+@_cdecl("apple_ai_token_count")
+public func appleAITokenCount(model: UnsafePointer<CChar>?, text: UnsafePointer<CChar>?) -> Int32 {
+    guard #available(macOS 26.4, *) else { return -2 }
+    guard case .onDevice = ModelKind.parse(model.map { String(cString: $0) }) else { return -1 }
+    guard let text else { return -1 }
+    let content = String(cString: text)
+
+    let semaphore = DispatchSemaphore(value: 0)
+    var result: Int32 = -1
+    Task {
+        defer { semaphore.signal() }
+        if let count = try? await SystemLanguageModel.default.tokenCount(for: content) {
+            result = Int32(count)
+        }
+    }
+    semaphore.wait()
+    return result
 }
 
 /// The on-device `SystemLanguageModel` to back a session with.
@@ -389,7 +418,175 @@ struct Guardrails {
     }
 }
 
+// MARK: - Typed errors across the FFI boundary
+
+/// A generation failure with a stable machine-readable `code`, so hosts can distinguish
+/// context-window overflow (trim the transcript and retry in a new session — see Apple's
+/// "Managing the context window") from guardrail violations, refusals, rate limits, etc.
+/// Serialized as JSON on both FFI error channels: the non-streaming result (`{"error": {...}}`)
+/// and the streaming ERROR_SENTINEL payload.
+private struct BridgeError {
+    let code: String
+    let message: String
+    /// Populated for `context-window-exceeded` on macOS 27+, where the framework reports the
+    /// window size and the offending token count (`LanguageModelError.ContextSizeExceeded`).
+    var contextSize: Int? = nil
+    var tokenCount: Int? = nil
+
+    var jsonObject: [String: Any] {
+        var object: [String: Any] = ["code": code, "message": message]
+        if let contextSize { object["contextSize"] = contextSize }
+        if let tokenCount { object["tokenCount"] = tokenCount }
+        return object
+    }
+
+    /// The full non-streaming error result: `{"error": {code, message, ...}}`.
+    var resultJson: String {
+        if let data = try? JSONSerialization.data(withJSONObject: ["error": jsonObject]),
+            let json = String(data: data, encoding: .utf8)
+        {
+            return json
+        }
+        return #"{"error":{"code":"unknown","message":"Error encoding failure"}}"#
+    }
+
+    /// The streaming error payload (the bare object; the sentinel byte tags the channel).
+    var streamJson: String {
+        if let data = try? JSONSerialization.data(withJSONObject: jsonObject),
+            let json = String(data: data, encoding: .utf8)
+        {
+            return json
+        }
+        return #"{"code":"unknown","message":"Error encoding failure"}"#
+    }
+}
+
+/// Map a thrown generation error onto a stable bridge code. macOS 27 throws the new top-level
+/// `LanguageModelError`; macOS 26 (and some 27 paths) throw `LanguageModelSession.GenerationError`
+/// — both are handled so the code is identical across OS versions.
+@available(macOS 26.0, *)
+private func mapToBridgeError(_ error: Error) -> BridgeError {
+    if #available(macOS 27.0, *), let modelError = error as? LanguageModelError {
+        let message = modelError.localizedDescription
+        switch modelError {
+        case .contextSizeExceeded(let info):
+            return BridgeError(
+                code: "context-window-exceeded", message: message,
+                contextSize: info.contextSize, tokenCount: info.tokenCount)
+        case .rateLimited:
+            return BridgeError(code: "rate-limited", message: message)
+        case .guardrailViolation:
+            return BridgeError(code: "guardrail-violation", message: message)
+        case .refusal:
+            return BridgeError(code: "refusal", message: message)
+        case .unsupportedCapability:
+            return BridgeError(code: "unsupported-capability", message: message)
+        case .unsupportedTranscriptContent:
+            return BridgeError(code: "unsupported-transcript-content", message: message)
+        case .unsupportedGenerationGuide:
+            return BridgeError(code: "unsupported-guide", message: message)
+        case .unsupportedLanguageOrLocale:
+            return BridgeError(code: "unsupported-language", message: message)
+        case .timeout:
+            return BridgeError(code: "timeout", message: message)
+        @unknown default:
+            return BridgeError(code: "unknown", message: message)
+        }
+    }
+    if let generationError = error as? LanguageModelSession.GenerationError {
+        let message = generationError.errorDescription ?? String(describing: generationError)
+        switch generationError {
+        case .exceededContextWindowSize:
+            return BridgeError(code: "context-window-exceeded", message: message)
+        case .guardrailViolation:
+            return BridgeError(code: "guardrail-violation", message: message)
+        case .refusal:
+            return BridgeError(code: "refusal", message: message)
+        case .rateLimited:
+            return BridgeError(code: "rate-limited", message: message)
+        case .concurrentRequests:
+            return BridgeError(code: "concurrent-requests", message: message)
+        case .assetsUnavailable:
+            return BridgeError(code: "assets-unavailable", message: message)
+        case .decodingFailure:
+            return BridgeError(code: "decoding-failure", message: message)
+        case .unsupportedGuide:
+            return BridgeError(code: "unsupported-guide", message: message)
+        case .unsupportedLanguageOrLocale:
+            return BridgeError(code: "unsupported-language", message: message)
+        @unknown default:
+            return BridgeError(code: "unknown", message: message)
+        }
+    }
+    if let toolError = error as? LanguageModelSession.ToolCallError {
+        return BridgeError(
+            code: "tool-call-error",
+            message:
+                "Tool '\(toolError.tool.name)' failed: \(toolError.underlyingError.localizedDescription)"
+        )
+    }
+    return BridgeError(code: "unknown", message: error.localizedDescription)
+}
+
+@available(macOS 26.0, *)
+private func mapConversationError(_ error: ConversationError) -> BridgeError {
+    switch error {
+    case .intelligenceUnavailable(let reason):
+        return BridgeError(
+            code: "unavailable", message: "Apple Intelligence not available - \(reason)")
+    case .invalidJSON(let reason):
+        return BridgeError(code: "invalid-json", message: reason)
+    case .noMessages:
+        return BridgeError(code: "no-messages", message: "No messages provided")
+    }
+}
+
 // MARK: - Helper functions
+
+/// Decoding options the host passes as one JSON object (extensible without touching the C ABI).
+/// `toolChoice` mirrors the AI SDK's tool choice: `"auto"` (default) | `"required"` | `"none"`;
+/// honored via `GenerationOptions.ToolCallingMode` on macOS 27+, best-effort ignored on 26.
+private struct GenerationOptionsInput: Codable {
+    let temperature: Double?
+    let topP: Double?
+    let topK: Int?
+    let seed: UInt64?
+    let maxTokens: Int?
+    let toolChoice: String?
+}
+
+/// Build `GenerationOptions` from the host's options JSON. `temperature: 0` is passed through
+/// (valid — maximally deterministic), unlike the old `> 0` guard that silently dropped it.
+/// Sampling: `topK` maps to `.random(top:seed:)`, `topP` to `.random(probabilityThreshold:seed:)`
+/// (top-k wins when both are set — it is the more specific request), and a bare `seed` pins the
+/// default random sampling reproducibly via a full-nucleus threshold.
+@available(macOS 26.0, *)
+private func makeGenerationOptions(_ input: GenerationOptionsInput?) -> GenerationOptions {
+    var options = GenerationOptions()
+    guard let input else { return options }
+
+    if let temperature = input.temperature {
+        options.temperature = temperature
+    }
+    if let maxTokens = input.maxTokens, maxTokens > 0 {
+        options.maximumResponseTokens = maxTokens
+    }
+    if let topK = input.topK, topK > 0 {
+        options.samplingMode = .random(top: topK, seed: input.seed)
+    } else if let topP = input.topP, topP > 0 {
+        options.samplingMode = .random(probabilityThreshold: topP, seed: input.seed)
+    } else if let seed = input.seed {
+        options.samplingMode = .random(probabilityThreshold: 1.0, seed: seed)
+    }
+    if #available(macOS 27.0, *) {
+        switch input.toolChoice {
+        case "required": options.toolCallingMode = .required
+        case "none": options.toolCallingMode = .disallowed
+        default: break
+        }
+    }
+    return options
+}
 
 /// Centralized conversation preparation logic used by all message-based functions
 private struct ConversationContext {
@@ -410,8 +607,7 @@ private enum ConversationError: Error {
 
 private func prepareConversationContext(
     messagesJsonString: String,
-    temperature: Double,
-    maxTokens: Int32,
+    optionsJsonString: String?,
     modelKind: ModelKind,
     reasoningLevel: String?
 ) throws -> ConversationContext {
@@ -484,16 +680,17 @@ private func prepareConversationContext(
     let historyMessages = lastIsUserPrompt ? Array(messages.dropLast()) : messages
     let transcriptEntries = convertMessagesToTranscript(historyMessages)
 
-    // Create generation options
-    var options = GenerationOptions()
-    if temperature > 0 {
-        options.temperature = temperature
-        if maxTokens > 0 {
-            options.maximumResponseTokens = Int(maxTokens)
+    // Decode generation options (temperature, sampling, token limits, tool choice).
+    var optionsInput: GenerationOptionsInput? = nil
+    if let optionsJsonString, !optionsJsonString.isEmpty {
+        guard let optionsData = optionsJsonString.data(using: .utf8),
+            let decoded = try? JSONDecoder().decode(GenerationOptionsInput.self, from: optionsData)
+        else {
+            throw ConversationError.invalidJSON("Invalid generation options JSON")
         }
-    } else if maxTokens > 0 {
-        options.maximumResponseTokens = Int(maxTokens)
+        optionsInput = decoded
     }
+    let options = makeGenerationOptions(optionsInput)
 
     return ConversationContext(
         currentPrompt: currentPrompt,
@@ -893,18 +1090,19 @@ private func createToolOutputEntry(from message: ChatMessage) -> [Transcript.Ent
 
 // Streaming callback sentinel prefixes. A chunk's first byte tags its channel; untagged chunks are
 // plain answer-text deltas. The Rust host decodes the same table:
-//   0x02  error         — the remainder is an error message
+//   0x02  error         — the remainder is a JSON error object: {code, message, contextSize?, tokenCount?}
 //   0x03  reasoning      — the remainder is a reasoning/chain-of-thought text delta (reserved)
 //   0x04  usage          — the remainder is a JSON usage object, emitted once before end-of-stream
 private let ERROR_SENTINEL: Character = "\u{0002}"
 private let REASONING_SENTINEL: Character = "\u{0003}"
 private let USAGE_SENTINEL: Character = "\u{0004}"
 
+@available(macOS 26.0, *)
 @inline(__always)
 private func emitError(
-    _ message: String, to onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)
+    _ error: BridgeError, to onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)
 ) {
-    let full = String(ERROR_SENTINEL) + message
+    let full = String(ERROR_SENTINEL) + error.streamJson
     full.withCString { cStr in
         onChunk(strdup(cStr))
     }
@@ -1322,8 +1520,7 @@ public func appleAIGenerateUnified(
     schemaJson: UnsafePointer<CChar>?,
     model: UnsafePointer<CChar>?,  // "on-device" (default) | "private-cloud"
     reasoningLevel: UnsafePointer<CChar>?,  // nil | "light" | "moderate" | "deep" | custom
-    temperature: Double,
-    maxTokens: Int32,
+    optionsJson: UnsafePointer<CChar>?,  // JSON: {temperature?, topP?, topK?, seed?, maxTokens?, toolChoice?}
     stream: Bool,
     stopAfterToolCalls: Bool,  // New parameter - controls early termination behavior
     onChunk: (@convention(c) (UnsafePointer<CChar>?) -> Void)?
@@ -1333,24 +1530,28 @@ public func appleAIGenerateUnified(
     let schemaJsonString = schemaJson.map { String(cString: $0) }
     let modelKind = ModelKind.parse(model.map { String(cString: $0) })
     let reasoningLevelString = reasoningLevel.map { String(cString: $0) }
+    let optionsJsonString = optionsJson.map { String(cString: $0) }
 
     // Validate streaming parameters
     if stream && onChunk == nil {
-        return strdup("Error: Streaming requested but no callback provided")
+        return strdup(
+            BridgeError(
+                code: "invalid-json", message: "Streaming requested but no callback provided"
+            ).resultJson)
     }
 
     // For non-streaming mode, use a semaphore
     if !stream {
         let semaphore = DispatchSemaphore(value: 0)
-        var result: String = "Error: No response"
+        var result: String =
+            BridgeError(code: "unknown", message: "No response").resultJson
 
         Task {
             do {
                 // Parse messages and prepare context
                 let context = try prepareConversationContext(
                     messagesJsonString: messagesJsonString,
-                    temperature: temperature,
-                    maxTokens: maxTokens,
+                    optionsJsonString: optionsJsonString,
                     modelKind: modelKind,
                     reasoningLevel: reasoningLevelString
                 )
@@ -1377,16 +1578,9 @@ public func appleAIGenerateUnified(
                     result = try await handleBasicMode(context: context)
                 }
             } catch let error as ConversationError {
-                switch error {
-                case .intelligenceUnavailable(let reason):
-                    result = "Error: Apple Intelligence not available - \(reason)"
-                case .invalidJSON(let reason):
-                    result = "Error: \(reason)"
-                case .noMessages:
-                    result = "Error: No messages provided"
-                }
+                result = mapConversationError(error).resultJson
             } catch {
-                result = "Error: \(error.localizedDescription)"
+                result = mapToBridgeError(error).resultJson
             }
             semaphore.signal()
         }
@@ -1403,8 +1597,7 @@ public func appleAIGenerateUnified(
                 // Parse messages and prepare context
                 let context = try prepareConversationContext(
                     messagesJsonString: messagesJsonString,
-                    temperature: temperature,
-                    maxTokens: maxTokens,
+                    optionsJsonString: optionsJsonString,
                     modelKind: modelKind,
                     reasoningLevel: reasoningLevelString
                 )
@@ -1423,8 +1616,13 @@ public func appleAIGenerateUnified(
                         onChunk: onChunk
                     )
                 } else if let schemaStr = schemaJsonString, !schemaStr.isEmpty {
-                    // Structured generation doesn't support streaming
-                    emitError("Structured generation does not support streaming", to: onChunk!)
+                    // Structured generation doesn't support streaming (the host simulates a
+                    // stream from the non-streaming structured path instead).
+                    emitError(
+                        BridgeError(
+                            code: "unsupported-capability",
+                            message: "Structured generation does not support streaming"),
+                        to: onChunk!)
                 } else {
                     // Basic generation with streaming
                     try await handleBasicModeStream(
@@ -1437,16 +1635,9 @@ public func appleAIGenerateUnified(
                 // consumer sees a normal end-of-stream, not an error.
                 onChunk!(nil)
             } catch let error as ConversationError {
-                switch error {
-                case .intelligenceUnavailable(let reason):
-                    emitError("Apple Intelligence not available - \(reason)", to: onChunk!)
-                case .invalidJSON(let reason):
-                    emitError(reason, to: onChunk!)
-                case .noMessages:
-                    emitError("No messages", to: onChunk!)
-                }
+                emitError(mapConversationError(error), to: onChunk!)
             } catch {
-                emitError(error.localizedDescription, to: onChunk!)
+                emitError(mapToBridgeError(error), to: onChunk!)
             }
         }
         StreamTaskRegistry.shared.store(task)

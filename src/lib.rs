@@ -67,6 +67,19 @@ pub struct AppleAIGenerateRequest {
     pub reasoning_level: Option<String>,
     pub temperature: Option<f64>,
     pub max_tokens: Option<i32>,
+    /// Nucleus sampling threshold, mapped onto `GenerationOptions.SamplingMode.random(probabilityThreshold:)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    /// Top-k sampling, mapped onto `GenerationOptions.SamplingMode.random(top:)`. Wins over `top_p`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i32>,
+    /// Sampling seed for reproducible generations (threads into the sampling mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+    /// Tool choice: `"auto"` (default) | `"required"` | `"none"`. Honored via
+    /// `GenerationOptions.ToolCallingMode` on macOS 27+; best-effort ignored on macOS 26.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<String>,
     pub stop_after_tool_calls: Option<bool>,
 }
 
@@ -115,7 +128,11 @@ pub struct AppleAIStreamStart {
 }
 
 #[derive(Serialize, Deserialize, specta::Type, Clone, Debug)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum AppleAIStreamEvent {
     #[serde(rename = "text")]
     Text { text: String },
@@ -131,26 +148,71 @@ pub enum AppleAIStreamEvent {
     Usage { usage: AppleAIUsage },
     #[serde(rename = "done")]
     Done,
+    /// A typed generation failure. `code` is a stable machine-readable code (e.g.
+    /// `context-window-exceeded`, `guardrail-violation`, `refusal`, `rate-limited`) so consumers
+    /// can implement the documented recovery strategies (trim the transcript and retry, surface a
+    /// content warning, back off). `context_size`/`token_count` accompany
+    /// `context-window-exceeded` on macOS 27+.
     #[serde(rename = "error")]
-    Error { message: String },
+    Error {
+        code: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_size: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token_count: Option<i64>,
+    },
 }
 
 #[derive(Serialize, specta::Type, Debug)]
-#[serde(tag = "type", content = "message", rename_all = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum AppleAIError {
-    UnsupportedPlatform(String),
-    NativeError(String),
-    StreamBusy(String),
-    InvalidPayload(String),
+    UnsupportedPlatform {
+        message: String,
+    },
+    NativeError {
+        message: String,
+    },
+    StreamBusy {
+        message: String,
+    },
+    InvalidPayload {
+        message: String,
+    },
+    /// A typed generation failure from the FoundationModels framework. Same `code` table as
+    /// [`AppleAIStreamEvent::Error`]; `context_size`/`token_count` accompany
+    /// `context-window-exceeded` on macOS 27+.
+    Generation {
+        code: String,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_size: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_count: Option<i64>,
+    },
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+impl AppleAIError {
+    fn unsupported_platform() -> Self {
+        AppleAIError::UnsupportedPlatform {
+            message: "Apple Intelligence is only available on Apple Silicon macOS".into(),
+        }
+    }
 }
 
 impl std::fmt::Display for AppleAIError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AppleAIError::UnsupportedPlatform(message)
-            | AppleAIError::NativeError(message)
-            | AppleAIError::StreamBusy(message)
-            | AppleAIError::InvalidPayload(message) => write!(f, "{message}"),
+            AppleAIError::UnsupportedPlatform { message }
+            | AppleAIError::NativeError { message }
+            | AppleAIError::StreamBusy { message }
+            | AppleAIError::InvalidPayload { message } => write!(f, "{message}"),
+            AppleAIError::Generation { code, message, .. } => write!(f, "[{code}] {message}"),
         }
     }
 }
@@ -203,9 +265,23 @@ pub fn apple_ai_supported_languages() -> Result<Vec<String>, AppleAIError> {
 }
 
 /// Prewarm a model so the next request pays less first-token latency. Best-effort; returns `Ok(())`
-/// even when the model can't be prewarmed on this OS.
-pub fn apple_ai_prewarm(model: Option<String>) -> Result<(), AppleAIError> {
-    native::prewarm(model)
+/// even when the model can't be prewarmed on this OS. `prompt_prefix` optionally lets the system
+/// eagerly process a known prefix of the upcoming prompt (e.g. the system instructions) for a
+/// further latency win (`LanguageModelSession.prewarm(promptPrefix:)`).
+pub fn apple_ai_prewarm(
+    model: Option<String>,
+    prompt_prefix: Option<String>,
+) -> Result<(), AppleAIError> {
+    native::prewarm(model, prompt_prefix)
+}
+
+/// Token count for `text` measured by the on-device model's tokenizer
+/// (`SystemLanguageModel.tokenCount(for:)`, macOS 26.4+). Combine with [`apple_ai_context_info`]
+/// to budget prompts against the real context window before sending them. Returns `-2` when the
+/// OS is too old, `-1` when the count can't be determined (model unavailable, or the
+/// Private Cloud Compute model, which exposes no tokenizer).
+pub fn apple_ai_token_count(model: Option<String>, text: String) -> Result<i64, AppleAIError> {
+    native::token_count(model, text)
 }
 
 #[doc(hidden)]
@@ -424,7 +500,109 @@ macro_rules! __cmd__apple_ai_prewarm {
                 }
             };
 
-            let result = $path(model);
+            let prompt_prefix =
+                match ::tauri::ipc::CommandArg::from_command(::tauri::ipc::CommandItem {
+                    plugin: None,
+                    name: "apple_ai_prewarm",
+                    key: "promptPrefix",
+                    message: &__tauri_message__,
+                    acl: &__tauri_acl__,
+                }) {
+                    Ok(arg) => arg,
+                    Err(err) => {
+                        __tauri_resolver__.invoke_error(err);
+                        return true;
+                    }
+                };
+
+            let result = $path(model, prompt_prefix);
+            let kind = (&result).blocking_kind();
+            kind.block(result, __tauri_resolver__);
+            return true;
+        }()
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __cmd__apple_ai_token_count {
+    ($path:path, $invoke:ident) => {{
+        move || {
+            #[allow(unused_imports)]
+            use ::tauri::ipc::private::*;
+            #[allow(unused_variables)]
+            let ::tauri::ipc::Invoke {
+                message: __tauri_message__,
+                resolver: __tauri_resolver__,
+                acl: __tauri_acl__,
+            } = $invoke;
+
+            let model = match ::tauri::ipc::CommandArg::from_command(::tauri::ipc::CommandItem {
+                plugin: None,
+                name: "apple_ai_token_count",
+                key: "model",
+                message: &__tauri_message__,
+                acl: &__tauri_acl__,
+            }) {
+                Ok(arg) => arg,
+                Err(err) => {
+                    __tauri_resolver__.invoke_error(err);
+                    return true;
+                }
+            };
+
+            let text = match ::tauri::ipc::CommandArg::from_command(::tauri::ipc::CommandItem {
+                plugin: None,
+                name: "apple_ai_token_count",
+                key: "text",
+                message: &__tauri_message__,
+                acl: &__tauri_acl__,
+            }) {
+                Ok(arg) => arg,
+                Err(err) => {
+                    __tauri_resolver__.invoke_error(err);
+                    return true;
+                }
+            };
+
+            let result = $path(model, text);
+            let kind = (&result).blocking_kind();
+            kind.block(result, __tauri_resolver__);
+            return true;
+        }()
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __cmd__apple_ai_cancel_stream {
+    ($path:path, $invoke:ident) => {{
+        move || {
+            #[allow(unused_imports)]
+            use ::tauri::ipc::private::*;
+            #[allow(unused_variables)]
+            let ::tauri::ipc::Invoke {
+                message: __tauri_message__,
+                resolver: __tauri_resolver__,
+                acl: __tauri_acl__,
+            } = $invoke;
+
+            let stream_id: String =
+                match ::tauri::ipc::CommandArg::from_command(::tauri::ipc::CommandItem {
+                    plugin: None,
+                    name: "apple_ai_cancel_stream",
+                    key: "streamId",
+                    message: &__tauri_message__,
+                    acl: &__tauri_acl__,
+                }) {
+                    Ok(arg) => arg,
+                    Err(err) => {
+                        __tauri_resolver__.invoke_error(err);
+                        return true;
+                    }
+                };
+
+            let result = $path(&stream_id);
             let kind = (&result).blocking_kind();
             kind.block(result, __tauri_resolver__);
             return true;
@@ -452,7 +630,14 @@ mod native {
         fn apple_ai_pcc_check_availability() -> i32;
         fn apple_ai_pcc_get_availability_reason() -> *mut std::os::raw::c_char;
         fn apple_ai_context_size(model: *const std::os::raw::c_char) -> i32;
-        fn apple_ai_prewarm(model: *const std::os::raw::c_char);
+        fn apple_ai_prewarm(
+            model: *const std::os::raw::c_char,
+            prompt_prefix: *const std::os::raw::c_char,
+        );
+        fn apple_ai_token_count(
+            model: *const std::os::raw::c_char,
+            text: *const std::os::raw::c_char,
+        ) -> i32;
         fn apple_ai_get_supported_languages_count() -> i32;
         fn apple_ai_get_supported_language(index: i32) -> *mut std::os::raw::c_char;
 
@@ -469,8 +654,7 @@ mod native {
             schema_json: *const std::os::raw::c_char,
             model: *const std::os::raw::c_char,
             reasoning_level: *const std::os::raw::c_char,
-            temperature: f64,
-            max_tokens: i32,
+            options_json: *const std::os::raw::c_char,
             stream: bool,
             stop_after_tool_calls: bool,
             on_chunk: Option<extern "C" fn(*const std::os::raw::c_char)>,
@@ -537,33 +721,96 @@ mod native {
         }
     }
 
+    /// Serialize decoding options into the single JSON object `apple_ai_generate_unified` takes
+    /// (extensible without touching the C ABI). Absent fields are omitted so the Swift decoder
+    /// sees `nil`.
+    fn serialize_options(request: &AppleAIGenerateRequest) -> Result<CString, AppleAIError> {
+        let mut options = serde_json::Map::new();
+        if let Some(temperature) = request.temperature {
+            options.insert("temperature".into(), json!(temperature));
+        }
+        if let Some(max_tokens) = request.max_tokens {
+            options.insert("maxTokens".into(), json!(max_tokens));
+        }
+        if let Some(top_p) = request.top_p {
+            options.insert("topP".into(), json!(top_p));
+        }
+        if let Some(top_k) = request.top_k {
+            options.insert("topK".into(), json!(top_k));
+        }
+        if let Some(seed) = request.seed {
+            options.insert("seed".into(), json!(seed));
+        }
+        if let Some(tool_choice) = &request.tool_choice {
+            options.insert("toolChoice".into(), json!(tool_choice));
+        }
+        let options_json =
+            serde_json::to_string(&serde_json::Value::Object(options)).map_err(|e| {
+                AppleAIError::InvalidPayload {
+                    message: e.to_string(),
+                }
+            })?;
+        CString::new(options_json).map_err(|_| AppleAIError::InvalidPayload {
+            message: "Options contained null byte".into(),
+        })
+    }
+
+    /// Parse a typed `{"error": {code, message, ...}}` object from the Swift bridge into the
+    /// matching [`AppleAIError::Generation`].
+    fn parse_bridge_error(error: &serde_json::Value) -> AppleAIError {
+        AppleAIError::Generation {
+            code: error
+                .get("code")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            message: error
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Unknown generation error")
+                .to_string(),
+            context_size: error.get("contextSize").and_then(|value| value.as_i64()),
+            token_count: error.get("tokenCount").and_then(|value| value.as_i64()),
+        }
+    }
+
     pub fn generate(
         request: AppleAIGenerateRequest,
     ) -> Result<AppleAIGenerateResult, AppleAIError> {
         ensure_initialized()?;
 
-        let messages_json = serde_json::to_string(&request.messages)
-            .map_err(|e| AppleAIError::InvalidPayload(e.to_string()))?;
+        let messages_json =
+            serde_json::to_string(&request.messages).map_err(|e| AppleAIError::InvalidPayload {
+                message: e.to_string(),
+            })?;
         let tools_json = serialize_tools(&request.tools)?;
         let schema_json = request
             .schema
             .as_ref()
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|e| AppleAIError::InvalidPayload(e.to_string()))?;
+            .map_err(|e| AppleAIError::InvalidPayload {
+                message: e.to_string(),
+            })?;
 
-        let c_messages = CString::new(messages_json)
-            .map_err(|_| AppleAIError::InvalidPayload("Messages contained null byte".into()))?;
-        let c_tools = tools_json
-            .map(CString::new)
-            .transpose()
-            .map_err(|_| AppleAIError::InvalidPayload("Tools contained null byte".into()))?;
-        let c_schema = schema_json
-            .map(CString::new)
-            .transpose()
-            .map_err(|_| AppleAIError::InvalidPayload("Schema contained null byte".into()))?;
+        let c_messages = CString::new(messages_json).map_err(|_| AppleAIError::InvalidPayload {
+            message: "Messages contained null byte".into(),
+        })?;
+        let c_tools =
+            tools_json
+                .map(CString::new)
+                .transpose()
+                .map_err(|_| AppleAIError::InvalidPayload {
+                    message: "Tools contained null byte".into(),
+                })?;
+        let c_schema = schema_json.map(CString::new).transpose().map_err(|_| {
+            AppleAIError::InvalidPayload {
+                message: "Schema contained null byte".into(),
+            }
+        })?;
         let c_model = optional_cstring(request.model.as_deref())?;
         let c_reasoning = optional_cstring(request.reasoning_level.as_deref())?;
+        let c_options = serialize_options(&request)?;
 
         if request.tools.as_ref().is_some_and(|t| !t.is_empty()) {
             register_tool_callback();
@@ -584,8 +831,7 @@ mod native {
                 c_reasoning
                     .as_ref()
                     .map_or(std::ptr::null(), |value| value.as_ptr()),
-                request.temperature.unwrap_or(0.0),
-                request.max_tokens.unwrap_or(0),
+                c_options.as_ptr(),
                 false,
                 request.stop_after_tool_calls.unwrap_or(true),
                 None,
@@ -593,18 +839,18 @@ mod native {
         };
 
         if result_ptr.is_null() {
-            return Err(AppleAIError::NativeError("Generation returned null".into()));
+            return Err(AppleAIError::NativeError {
+                message: "Generation returned null".into(),
+            });
         }
 
         let raw = take_c_string(result_ptr);
-        if raw.starts_with("Error: ") {
-            return Err(AppleAIError::NativeError(
-                raw.trim_start_matches("Error: ").to_string(),
-            ));
-        }
-
         let parsed: serde_json::Value =
-            serde_json::from_str(&raw).map_err(|e| AppleAIError::InvalidPayload(e.to_string()))?;
+            serde_json::from_str(&raw).map_err(|_| AppleAIError::NativeError { message: raw })?;
+
+        if let Some(error) = parsed.get("error") {
+            return Err(parse_bridge_error(error));
+        }
 
         let text = parsed
             .get("text")
@@ -633,9 +879,9 @@ mod native {
         ensure_initialized()?;
 
         if STREAM_ACTIVE.swap(true, Ordering::SeqCst) {
-            return Err(AppleAIError::StreamBusy(
-                "Another Apple Intelligence stream is already active".into(),
-            ));
+            return Err(AppleAIError::StreamBusy {
+                message: "Another Apple Intelligence stream is already active".into(),
+            });
         }
 
         let stream_id = uuid::Uuid::new_v4().to_string();
@@ -664,28 +910,38 @@ mod native {
             .unwrap()
             .clear();
 
-        let messages_json = serde_json::to_string(&request.messages)
-            .map_err(|e| AppleAIError::InvalidPayload(e.to_string()))?;
+        let messages_json =
+            serde_json::to_string(&request.messages).map_err(|e| AppleAIError::InvalidPayload {
+                message: e.to_string(),
+            })?;
         let tools_json = serialize_tools(&request.tools)?;
         let schema_json = request
             .schema
             .as_ref()
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|e| AppleAIError::InvalidPayload(e.to_string()))?;
+            .map_err(|e| AppleAIError::InvalidPayload {
+                message: e.to_string(),
+            })?;
 
-        let c_messages = CString::new(messages_json)
-            .map_err(|_| AppleAIError::InvalidPayload("Messages contained null byte".into()))?;
-        let c_tools = tools_json
-            .map(CString::new)
-            .transpose()
-            .map_err(|_| AppleAIError::InvalidPayload("Tools contained null byte".into()))?;
-        let c_schema = schema_json
-            .map(CString::new)
-            .transpose()
-            .map_err(|_| AppleAIError::InvalidPayload("Schema contained null byte".into()))?;
+        let c_messages = CString::new(messages_json).map_err(|_| AppleAIError::InvalidPayload {
+            message: "Messages contained null byte".into(),
+        })?;
+        let c_tools =
+            tools_json
+                .map(CString::new)
+                .transpose()
+                .map_err(|_| AppleAIError::InvalidPayload {
+                    message: "Tools contained null byte".into(),
+                })?;
+        let c_schema = schema_json.map(CString::new).transpose().map_err(|_| {
+            AppleAIError::InvalidPayload {
+                message: "Schema contained null byte".into(),
+            }
+        })?;
         let c_model = optional_cstring(request.model.as_deref())?;
         let c_reasoning = optional_cstring(request.reasoning_level.as_deref())?;
+        let c_options = serialize_options(&request)?;
 
         if request.tools.as_ref().is_some_and(|t| !t.is_empty()) {
             register_tool_callback();
@@ -706,8 +962,7 @@ mod native {
                 c_reasoning
                     .as_ref()
                     .map_or(std::ptr::null(), |value| value.as_ptr()),
-                request.temperature.unwrap_or(0.0),
-                request.max_tokens.unwrap_or(0),
+                c_options.as_ptr(),
                 true,
                 request.stop_after_tool_calls.unwrap_or(true),
                 Some(stream_chunk_callback),
@@ -763,13 +1018,27 @@ mod native {
     pub fn context_info(model: Option<String>) -> Result<AppleAIContextInfo, AppleAIError> {
         ensure_initialized()?;
         let model = model.unwrap_or_else(|| "on-device".to_string());
-        let c_model = CString::new(model.clone())
-            .map_err(|_| AppleAIError::InvalidPayload("Model contained null byte".into()))?;
+        let c_model = CString::new(model.clone()).map_err(|_| AppleAIError::InvalidPayload {
+            message: "Model contained null byte".into(),
+        })?;
         let size = unsafe { apple_ai_context_size(c_model.as_ptr()) };
         Ok(AppleAIContextInfo {
             model,
             context_size: size as i64,
         })
+    }
+
+    pub fn token_count(model: Option<String>, text: String) -> Result<i64, AppleAIError> {
+        ensure_initialized()?;
+        let model = model.unwrap_or_else(|| "on-device".to_string());
+        let c_model = CString::new(model).map_err(|_| AppleAIError::InvalidPayload {
+            message: "Model contained null byte".into(),
+        })?;
+        let c_text = CString::new(text).map_err(|_| AppleAIError::InvalidPayload {
+            message: "Text contained null byte".into(),
+        })?;
+        let count = unsafe { apple_ai_token_count(c_model.as_ptr(), c_text.as_ptr()) };
+        Ok(count as i64)
     }
 
     pub fn supported_languages() -> Result<Vec<String>, AppleAIError> {
@@ -794,12 +1063,24 @@ mod native {
         }
     }
 
-    pub fn prewarm(model: Option<String>) -> Result<(), AppleAIError> {
+    pub fn prewarm(
+        model: Option<String>,
+        prompt_prefix: Option<String>,
+    ) -> Result<(), AppleAIError> {
         ensure_initialized()?;
         let model = model.unwrap_or_else(|| "on-device".to_string());
-        let c_model = CString::new(model)
-            .map_err(|_| AppleAIError::InvalidPayload("Model contained null byte".into()))?;
-        unsafe { apple_ai_prewarm(c_model.as_ptr()) };
+        let c_model = CString::new(model).map_err(|_| AppleAIError::InvalidPayload {
+            message: "Model contained null byte".into(),
+        })?;
+        let c_prefix = optional_cstring(prompt_prefix.as_deref())?;
+        unsafe {
+            apple_ai_prewarm(
+                c_model.as_ptr(),
+                c_prefix
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+            )
+        };
         Ok(())
     }
 
@@ -810,8 +1091,8 @@ mod native {
             .filter(|s| !s.is_empty())
             .map(CString::new)
             .transpose()
-            .map_err(|_| {
-                AppleAIError::InvalidPayload("string contained an interior null byte".into())
+            .map_err(|_| AppleAIError::InvalidPayload {
+                message: "string contained an interior null byte".into(),
             })
     }
 
@@ -852,7 +1133,9 @@ mod native {
 
         serde_json::to_string(&payload)
             .map(Some)
-            .map_err(|e| AppleAIError::InvalidPayload(e.to_string()))
+            .map_err(|e| AppleAIError::InvalidPayload {
+                message: e.to_string(),
+            })
     }
 
     fn register_tool_callback() {
@@ -919,8 +1202,32 @@ mod native {
         let bytes = slice.as_bytes();
         match bytes.first() {
             Some(&ERROR_SENTINEL) => {
-                let message = String::from_utf8_lossy(&bytes[1..]).into_owned();
-                emit_event(state, AppleAIStreamEvent::Error { message });
+                // The payload is a typed JSON error object from the Swift bridge:
+                // {code, message, contextSize?, tokenCount?}.
+                let payload = String::from_utf8_lossy(&bytes[1..]).into_owned();
+                let event = match serde_json::from_str::<serde_json::Value>(&payload) {
+                    Ok(parsed) => AppleAIStreamEvent::Error {
+                        code: parsed
+                            .get("code")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        message: parsed
+                            .get("message")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or(&payload)
+                            .to_string(),
+                        context_size: parsed.get("contextSize").and_then(|value| value.as_i64()),
+                        token_count: parsed.get("tokenCount").and_then(|value| value.as_i64()),
+                    },
+                    Err(_) => AppleAIStreamEvent::Error {
+                        code: "unknown".to_string(),
+                        message: payload,
+                        context_size: None,
+                        token_count: None,
+                    },
+                };
+                emit_event(state, event);
                 STREAM_ACTIVE.store(false, Ordering::SeqCst);
                 *guard = None;
                 return;
@@ -989,55 +1296,107 @@ mod native {
     use super::*;
 
     pub fn check_availability() -> Result<AppleAIAvailability, AppleAIError> {
-        Err(AppleAIError::UnsupportedPlatform(
-            "Apple Intelligence is only available on Apple Silicon macOS".into(),
-        ))
+        Err(AppleAIError::unsupported_platform())
     }
 
     pub fn generate(
         _request: AppleAIGenerateRequest,
     ) -> Result<AppleAIGenerateResult, AppleAIError> {
-        Err(AppleAIError::UnsupportedPlatform(
-            "Apple Intelligence is only available on Apple Silicon macOS".into(),
-        ))
+        Err(AppleAIError::unsupported_platform())
     }
 
     pub fn stream<R: tauri::Runtime>(
         _app: AppHandle<R>,
         _request: AppleAIGenerateRequest,
     ) -> Result<AppleAIStreamStart, AppleAIError> {
-        Err(AppleAIError::UnsupportedPlatform(
-            "Apple Intelligence is only available on Apple Silicon macOS".into(),
-        ))
+        Err(AppleAIError::unsupported_platform())
     }
 
     pub fn cancel_stream(_stream_id: &str) -> Result<bool, AppleAIError> {
-        Err(AppleAIError::UnsupportedPlatform(
-            "Apple Intelligence is only available on Apple Silicon macOS".into(),
-        ))
+        Err(AppleAIError::unsupported_platform())
     }
 
     pub fn pcc_check_availability() -> Result<AppleAIAvailability, AppleAIError> {
-        Err(AppleAIError::UnsupportedPlatform(
-            "Apple Intelligence is only available on Apple Silicon macOS".into(),
-        ))
+        Err(AppleAIError::unsupported_platform())
     }
 
     pub fn context_info(_model: Option<String>) -> Result<AppleAIContextInfo, AppleAIError> {
-        Err(AppleAIError::UnsupportedPlatform(
-            "Apple Intelligence is only available on Apple Silicon macOS".into(),
-        ))
+        Err(AppleAIError::unsupported_platform())
     }
 
     pub fn supported_languages() -> Result<Vec<String>, AppleAIError> {
-        Err(AppleAIError::UnsupportedPlatform(
-            "Apple Intelligence is only available on Apple Silicon macOS".into(),
-        ))
+        Err(AppleAIError::unsupported_platform())
     }
 
-    pub fn prewarm(_model: Option<String>) -> Result<(), AppleAIError> {
-        Err(AppleAIError::UnsupportedPlatform(
-            "Apple Intelligence is only available on Apple Silicon macOS".into(),
-        ))
+    pub fn prewarm(
+        _model: Option<String>,
+        _prompt_prefix: Option<String>,
+    ) -> Result<(), AppleAIError> {
+        Err(AppleAIError::unsupported_platform())
+    }
+
+    pub fn token_count(_model: Option<String>, _text: String) -> Result<i64, AppleAIError> {
+        Err(AppleAIError::unsupported_platform())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stream events cross the Tauri event channel as JSON consumed by the TS transport —
+    /// field names must be camelCase (`toolCallId`, `contextSize`), which requires
+    /// `rename_all_fields` (serde's `rename_all` on an enum renames variants only).
+    #[test]
+    fn stream_events_serialize_camel_case() {
+        let tool_call = AppleAIStreamEvent::ToolCall {
+            tool_call_id: "call_1".into(),
+            tool_name: "weather".into(),
+            args: serde_json::json!({"city": "Athens"}),
+        };
+        assert_eq!(
+            serde_json::to_value(&tool_call).unwrap(),
+            serde_json::json!({
+                "type": "tool-call",
+                "toolCallId": "call_1",
+                "toolName": "weather",
+                "args": {"city": "Athens"},
+            })
+        );
+
+        let error = AppleAIStreamEvent::Error {
+            code: "context-window-exceeded".into(),
+            message: "too long".into(),
+            context_size: Some(4096),
+            token_count: Some(5000),
+        };
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            serde_json::json!({
+                "type": "error",
+                "code": "context-window-exceeded",
+                "message": "too long",
+                "contextSize": 4096,
+                "tokenCount": 5000,
+            })
+        );
+    }
+
+    #[test]
+    fn generation_error_serializes_typed_shape() {
+        let error = AppleAIError::Generation {
+            code: "guardrail-violation".into(),
+            message: "blocked".into(),
+            context_size: None,
+            token_count: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&error).unwrap(),
+            serde_json::json!({
+                "type": "generation",
+                "code": "guardrail-violation",
+                "message": "blocked",
+            })
+        );
     }
 }
