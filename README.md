@@ -18,13 +18,24 @@ tauri-apple-intelligence = "0.6"
 |---|---|---|
 | Availability (on-device) | `apple_ai_check_availability` | Device eligible + Apple Intelligence enabled + model ready |
 | Availability (Private Cloud Compute) | `apple_ai_pcc_check_availability` | macOS 27+; larger, reasoning-capable, still private (no API key/bill) |
-| Generate / stream | `apple_ai_generate`, `apple_ai_stream`, `apple_ai_cancel_stream` | Basic, tools, and structured modes; `model: "on-device" \| "private-cloud"`, `reasoningLevel`, and per-message `images` |
+| Generate / stream | `apple_ai_generate`, `apple_ai_stream`, `apple_ai_cancel_stream` | Basic, tools, and structured modes; `model: "on-device" \| "private-cloud"`, `reasoningLevel`, sampling (`temperature` incl. `0`, `topP`, `topK`, `seed`), `toolChoice` (macOS 27), and per-message `images` |
 | Context window | `apple_ai_context_info` | Real `contextSize` per model (4k on-device, ~32k PCC) — stop hardcoding |
+| Token counting | `apple_ai_token_count` | Real tokenizer counts (`tokenCount(for:)`, macOS 26.4+) for budgeting prompts against `contextSize` |
 | Supported languages | `apple_ai_supported_languages` | Live BCP-47 tags from `SystemLanguageModel.supportedLanguages` |
-| Prewarm | `apple_ai_prewarm` | Lower first-token latency |
+| Prewarm | `apple_ai_prewarm` | Lower first-token latency; optional `promptPrefix` eagerly processes a known prompt prefix |
 
 Generation results and streams carry a `usage` object (`inputTokens`, `cachedInputTokens`,
 `outputTokens`, `reasoningTokens`) on macOS 27+.
+
+### Typed errors
+
+Generation failures carry a stable machine-readable `code` mirroring the FoundationModels error
+cases — `context-window-exceeded`, `guardrail-violation`, `refusal`, `rate-limited`,
+`concurrent-requests`, and more. Non-streaming commands reject with
+`{ type: "generation", code, message, contextSize?, tokenCount? }`; streams emit an `error` event
+with the same fields. `context-window-exceeded` includes the model's `contextSize` and the
+offending `tokenCount` (macOS 27+), so hosts can condense the conversation and retry — Apple's
+documented recovery strategy for the context window.
 
 ## Usage
 
@@ -34,8 +45,14 @@ Then register the commands in your `tauri::Builder`:
 tauri::Builder::default()
   .invoke_handler(tauri::generate_handler![
     tauri_apple_intelligence::apple_ai_check_availability,
+    tauri_apple_intelligence::apple_ai_pcc_check_availability,
     tauri_apple_intelligence::apple_ai_generate,
     tauri_apple_intelligence::apple_ai_stream,
+    tauri_apple_intelligence::apple_ai_cancel_stream,
+    tauri_apple_intelligence::apple_ai_context_info,
+    tauri_apple_intelligence::apple_ai_token_count,
+    tauri_apple_intelligence::apple_ai_supported_languages,
+    tauri_apple_intelligence::apple_ai_prewarm,
   ])
 ```
 
@@ -75,10 +92,13 @@ The JS transport expects `apple_ai_*` command names by default. If you rename th
 
 ## Supported platforms
 
-- ✅ macOS 26+ on Apple Silicon (on-device model, streaming, tools, structured output)
-- ✅ macOS 27+ adds Private Cloud Compute, reasoning levels, multimodal image input, and per-call
-  token usage — all gated behind `@available(macOS 27, *)`, so the crate still runs on macOS 26 with
-  those features simply unavailable
+- ✅ macOS 26+ on Apple Silicon (on-device model, streaming, tools, structured output, sampling
+  modes, typed error codes)
+- ✅ macOS 26.4+ adds `apple_ai_token_count` (`tokenCount(for:)`)
+- ✅ macOS 27+ adds Private Cloud Compute, reasoning levels, multimodal image input, per-call
+  token usage, native `toolChoice` enforcement, and context-size details on
+  `context-window-exceeded` errors — all gated behind `@available`, so the crate still runs on
+  macOS 26 with those features simply unavailable
 - ❌ Other platforms (returns `UnsupportedPlatform`)
 
 ## License
