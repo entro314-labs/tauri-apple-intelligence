@@ -1,6 +1,6 @@
 [package]
 name = "tauri-apple-intelligence"
-version = "0.6.6"
+version = "0.6.7"
 description = "Tauri commands and native bridge for Apple Intelligence"
 license = "MIT"
 readme = "README.md"

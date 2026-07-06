@@ -253,9 +253,8 @@ public func appleAIPrewarm(model: UnsafePointer<CChar>?, promptPrefix: UnsafePoi
     case .onDevice:
         // Prewarm only when the model instance is available. Calling `.prewarm()` on an unavailable
         // model trips a Swift `assertionFailure` inside FoundationModels on macOS 27 betas — a hard
-        // trap that aborts the process. Use the same on-device model `makeSession` uses (default
-        // guardrails on macOS 27 — see makeOnDeviceModel), so warm and real requests share a model
-        // and prewarm doesn't hit the permissive-guardrails regression on 26A5368g.
+        // trap that aborts the process. Use the same on-device model `makeSession` uses
+        // (see makeOnDeviceModel), so warm and real requests share a model.
         let onDeviceModel = makeOnDeviceModel()
         guard case .available = onDeviceModel.availability else { return }
         LanguageModelSession(model: onDeviceModel).prewarm(promptPrefix: prefix)
@@ -290,24 +289,22 @@ public func appleAITokenCount(model: UnsafePointer<CChar>?, text: UnsafePointer<
     return result
 }
 
-/// The on-device `SystemLanguageModel` to back a session with.
+/// The on-device `SystemLanguageModel` to back a session with: permissive
+/// content-transformation guardrails on every OS version.
 ///
-/// macOS 27 beta build 26A5368g regressed permissive guardrails: loading a session backed by
-/// `SystemLanguageModel(guardrails: .permissiveContentTransformations)` trips a Swift
-/// `assertionFailure` deep inside FoundationModels (the same assertion hit by both `prewarm()` and
-/// `respond(...)`) — a hard SIGTRAP that aborts the host process and can't be caught, since it's
-/// foreign code. The default-guardrails shared model (`SystemLanguageModel.default`, the exact
-/// instance the availability/context/languages probes use) does NOT assert. So on macOS 27 we use
-/// default guardrails (Apple's standard content filtering) to keep generation working, and keep the
-/// permissive content-transformation guardrails on macOS 26 where they still work. Revisit and
-/// restore permissive on macOS 27 once a later build stops asserting (permissive generation passed
-/// 3/3 on an earlier 27 build, so this is a beta regression, not a permanent API change).
+/// An earlier revision routed macOS 27 to `SystemLanguageModel.default` because permissive
+/// sessions appeared to trip an uncatchable `assertionFailure` inside FoundationModels on beta
+/// 26A5368g. That assertion was later root-caused to Private Cloud Compute use without the
+/// restricted `com.apple.developer.private-cloud-compute` entitlement — not to guardrails —
+/// and permissive on-device generation has since been re-verified on 26A5368g (out-of-tree
+/// probe: clean responses, no assertion). Permissive is also strictly more reliable there:
+/// the default-guardrails path additionally invokes SensitiveContentAnalysisML, whose model
+/// assets flap on the beta (`SensitiveContentAnalysisML error 15` wrapping
+/// `ModelManagerError 1013`), failing even benign prompts; the permissive path skips that
+/// classifier entirely.
 @available(macOS 26.0, *)
 private func makeOnDeviceModel() -> SystemLanguageModel {
-    if #available(macOS 27.0, *) {
-        return SystemLanguageModel.default
-    }
-    return SystemLanguageModel(guardrails: Guardrails.developerProvided)
+    SystemLanguageModel(guardrails: Guardrails.developerProvided)
 }
 
 /// Build a session backed by the requested model. Private Cloud Compute is used only on macOS 27+;
@@ -461,11 +458,36 @@ private struct BridgeError {
     }
 }
 
+/// Whether the NSError underlying-error chain bottoms out in the OS model manager failing to
+/// furnish model assets. On macOS 27 betas both the base model and the SensitiveContentAnalysisML
+/// safety classifier intermittently report `ModelManagerServices.ModelManagerError Code=1013`
+/// ("assets not resident") wrapped in a generic top-level `LanguageModelError Code=-1`, so without
+/// walking the chain these transient, retryable failures would surface as `unknown`.
+private func isModelAssetLoadingFailure(_ error: Error) -> Bool {
+    let ns = error as NSError
+    if ns.domain.contains("ModelManagerServices")
+        || ns.domain.contains("SensitiveContentAnalysisML")
+    {
+        return true
+    }
+    var underlying: [Error] = ns.userInfo[NSMultipleUnderlyingErrorsKey] as? [Error] ?? []
+    if let single = ns.userInfo[NSUnderlyingErrorKey] as? Error {
+        underlying.append(single)
+    }
+    return underlying.contains { isModelAssetLoadingFailure($0) }
+}
+
 /// Map a thrown generation error onto a stable bridge code. macOS 27 throws the new top-level
 /// `LanguageModelError`; macOS 26 (and some 27 paths) throw `LanguageModelSession.GenerationError`
 /// — both are handled so the code is identical across OS versions.
 @available(macOS 26.0, *)
 private func mapToBridgeError(_ error: Error) -> BridgeError {
+    // Checked first: these arrive as a generic `LanguageModelError Code=-1` whose real cause
+    // (model assets not resident yet — transient, retry after the model loads) is only visible
+    // in the underlying-error chain, and would otherwise fall through to `unknown`.
+    if isModelAssetLoadingFailure(error) {
+        return BridgeError(code: "assets-unavailable", message: error.localizedDescription)
+    }
     if #available(macOS 27.0, *), let modelError = error as? LanguageModelError {
         let message = modelError.localizedDescription
         switch modelError {

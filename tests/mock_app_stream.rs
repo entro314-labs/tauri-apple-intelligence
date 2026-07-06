@@ -79,8 +79,10 @@ fn cancel_frees_the_stream_slot_and_emits_done() {
         });
     }
 
-    // Wait until the model is actually streaming, then cancel mid-flight.
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Wait until the model is actually streaming, then cancel mid-flight. The deadline covers a
+    // cold model load: under memory pressure modelmanagerd can take 60s+ to make the model
+    // resident (or refuses outright with assets-unavailable — surfaced as an error event).
+    let deadline = Instant::now() + Duration::from_secs(90);
     while !saw_text.load(Ordering::SeqCst) {
         assert!(Instant::now() < deadline, "no text chunks arrived");
         std::thread::sleep(Duration::from_millis(50));
