@@ -1,7 +1,7 @@
 [package]
 name = "tauri-apple-intelligence"
-version = "0.6.10"
-description = "Tauri commands and native bridge for Apple Intelligence"
+version = "0.6.11"
+description = "DEPRECATED: merged into tauri-plugin-apple-intelligence. Tauri commands and native bridge for Apple Intelligence"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/entro314-labs/tauri-apple-intelligence"

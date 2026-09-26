@@ -1,5 +1,37 @@
 # tauri-apple-intelligence
 
+> [!WARNING]
+> **Deprecated.** This crate is no longer maintained. It has been merged into
+> [`tauri-plugin-apple-intelligence`](https://crates.io/crates/tauri-plugin-apple-intelligence)
+> ([repo](https://github.com/entro314-labs/tauri-plugin-apple-intelligence)), a proper Tauri v2
+> plugin with namespaced, permission-gated commands.
+
+## Migrating
+
+```diff
+  # src-tauri/Cargo.toml
+- tauri-apple-intelligence = "0.6"
++ tauri-plugin-apple-intelligence = "0.12"
+```
+
+```diff
+  tauri::Builder::default()
+-     .invoke_handler(tauri::generate_handler![
+-         tauri_apple_intelligence::apple_ai_check_availability,
+-         // ...the other apple_ai_* commands
+-     ])
++     .plugin(tauri_plugin_apple_intelligence::init())
+```
+
+Add `"apple-intelligence:default"` to your capability's `permissions`, and switch the frontend from
+`@entro314labs/apple-intelligence-sdk` to `@entro314labs/plugin-apple-intelligence`. Full steps
+(including bundling `libappleai.dylib`) are in the plugin's
+[Setup](https://github.com/entro314-labs/tauri-plugin-apple-intelligence#setup).
+
+The original documentation follows for users pinned to 0.6.x.
+
+---
+
 Native Tauri commands for Apple Intelligence (Foundation Models) with streaming, tool calling,
 **Private Cloud Compute**, **reasoning**, **multimodal image input**, and **live token/context usage**.
 
